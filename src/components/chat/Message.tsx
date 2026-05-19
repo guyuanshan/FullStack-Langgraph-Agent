@@ -6,12 +6,19 @@ type MessageProps = {
   message: ChatMessage;
   onConfirmTool?: (message: ChatMessage) => void;
   onRejectTool?: (message: ChatMessage) => void;
+  onApprovePatch?: (
+    message: ChatMessage,
+    files: Array<{ path: string; content: string }>
+  ) => void;
+  onRejectPatch?: (message: ChatMessage) => void;
 };
 
 export function Message({
   message,
   onConfirmTool,
   onRejectTool,
+  onApprovePatch,
+  onRejectPatch,
 }: MessageProps) {
     // 根据消息角色设置不同的样式
     const isUser = message.role === "user";
@@ -25,6 +32,8 @@ export function Message({
             message={message}
             onConfirm={onConfirmTool}
             onReject={onRejectTool}
+            onApprovePatch={onApprovePatch}
+            onRejectPatch={onRejectPatch}
           />
         </div>
       );

@@ -10,7 +10,11 @@ import {
   resolveToolRiskLevel,
 } from "../../lib/tools/policy";
 import { encodeSSE } from "../../lib/stream/sse";
-import { summarizeToolArgs } from "../../lib/tools/summary";
+import {
+  getResultUrl,
+  summarizeToolArgs,
+  summarizeToolResult,
+} from "../../lib/tools/summary";
 import {
   resetStepState,
   type AgentState,
@@ -143,6 +147,19 @@ export async function executeSingleToolCall(
   const toolSummary = summarizeToolArgs(args);
   const toolRiskLevel = resolveToolRiskLevel(tool, args);
   const toolPermissions = resolveToolPermissions(tool);
+  const executionArgs =
+    (name.startsWith("browser_") || name === "code_propose_patch") &&
+    state.sessionId
+      ? {
+          ...args,
+          ...(name.startsWith("browser_")
+            ? { browserSessionId: state.sessionId }
+            : {}),
+          ...(name === "code_propose_patch"
+            ? { agentSessionId: state.sessionId }
+            : {}),
+        }
+      : args;
 
   console.log(`[agent step ${state.step}] tool name:`, name);
   console.log(`[agent step ${state.step}] tool args:`, args);
@@ -162,13 +179,14 @@ export async function executeSingleToolCall(
     toolName: name,
     toolCallId: toolCall.id,
     source: tool?.source,
+    url: typeof args.url === "string" ? args.url : undefined,
     riskLevel: toolRiskLevel,
     permissions: toolPermissions,
     args,
     outcome: "started",
   });
 
-  const execution = await executeTool(name, args);
+  const execution = await executeTool(name, executionArgs);
 
   if (execution.ok) {
     console.log(`[agent step ${state.step}] tool result:`, execution.result);
@@ -182,10 +200,12 @@ export async function executeSingleToolCall(
       toolName: name,
       toolCallId: toolCall.id,
       source: tool?.source,
+      url: getResultUrl(execution.result) ?? (typeof args.url === "string" ? args.url : undefined),
       riskLevel: toolRiskLevel,
       permissions: toolPermissions,
       args,
       outcome: "success",
+      resultSummary: summarizeToolResult(execution.result),
       detail: JSON.stringify(execution.result),
     });
     return;
@@ -202,10 +222,12 @@ export async function executeSingleToolCall(
     toolName: name,
     toolCallId: toolCall.id,
     source: tool?.source,
+    url: typeof args.url === "string" ? args.url : undefined,
     riskLevel: toolRiskLevel,
     permissions: toolPermissions,
     args,
     outcome: "error",
+    resultSummary: message,
     detail: message,
   });
   console.log(`[agent step ${state.step}] tool error:`, message);

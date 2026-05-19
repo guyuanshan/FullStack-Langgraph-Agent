@@ -1,6 +1,6 @@
 import { lookup } from "node:dns/promises";
 import { existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -21,6 +21,18 @@ const maxLinkCount = Number.parseInt(
   process.env.BROWSER_MAX_LINK_COUNT ?? "200",
   10
 );
+const maxScreenshotBytes = Number.parseInt(
+  process.env.BROWSER_MAX_SCREENSHOT_BYTES ?? "450000",
+  10
+);
+const maxRedirects = Number.parseInt(
+  process.env.BROWSER_MAX_REDIRECTS ?? "5",
+  10
+);
+const maxPageHeight = Number.parseInt(
+  process.env.BROWSER_MAX_PAGE_HEIGHT ?? "6000",
+  10
+);
 const screenshotDir = path.join(process.cwd(), ".demo-output", "browser");
 const browserExecutablePath =
   process.env.BROWSER_EXECUTABLE_PATH?.trim() ||
@@ -38,8 +50,24 @@ const blocklist = (
   .filter(Boolean);
 
 let browserPromise = null;
-let contextPromise = null;
-let pagePromise = null;
+const browserSessions = new Map();
+
+function makeTextResult(payload) {
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(payload, null, 2),
+      },
+    ],
+    structuredContent: payload,
+  };
+}
+
+function normalizeSessionId(inputSessionId) {
+  const trimmed = typeof inputSessionId === "string" ? inputSessionId.trim() : "";
+  return trimmed || "default-browser-session";
+}
 
 function matchesDomainRule(hostname, rules) {
   const normalizedHostname = hostname.toLowerCase();
@@ -105,14 +133,36 @@ async function assertSafeUrl(inputUrl) {
     throw new Error("This hostname is not in the browser allowlist");
   }
 
-  const dnsResults = await lookup(parsedUrl.hostname, { all: true, verbatim: true })
-    .catch(() => []);
+  const dnsResults = await lookup(parsedUrl.hostname, {
+    all: true,
+    verbatim: true,
+  }).catch(() => []);
 
   if (dnsResults.some((result) => isPrivateAddress(result.address))) {
     throw new Error("Access to private or local network addresses is blocked");
   }
 
   return parsedUrl;
+}
+
+function countRedirects(request) {
+  let redirects = 0;
+  let current = request;
+
+  while (current?.redirectedFrom()) {
+    redirects += 1;
+    current = current.redirectedFrom();
+  }
+
+  return redirects;
+}
+
+function truncateText(text, maxChars) {
+  if (text.length <= maxChars) {
+    return text;
+  }
+
+  return `${text.slice(0, maxChars)}\n...[truncated]`;
 }
 
 async function getBrowser() {
@@ -132,74 +182,120 @@ async function getBrowser() {
   return browserPromise;
 }
 
-async function getContext() {
-  if (!contextPromise) {
-    contextPromise = (async () => {
-      const browser = await getBrowser();
-      return browser.newContext({
-        javaScriptEnabled: true,
-        ignoreHTTPSErrors: false,
-      });
-    })();
-  }
-
-  return contextPromise;
+async function buildSessionState(sessionId) {
+  const browser = await getBrowser();
+  const context = await browser.newContext({
+    javaScriptEnabled: true,
+    ignoreHTTPSErrors: false,
+    viewport: {
+      width: 1440,
+      height: 1024,
+    },
+  });
+  const page = await context.newPage();
+  page.setDefaultTimeout(timeoutMs);
+  const sessionState = {
+    sessionId,
+    context,
+    page,
+  };
+  browserSessions.set(sessionId, sessionState);
+  return sessionState;
 }
 
-async function getPage() {
-  if (!pagePromise) {
-    pagePromise = (async () => {
-      const context = await getContext();
-      const page = await context.newPage();
-      page.setDefaultTimeout(timeoutMs);
-      return page;
-    })();
+async function getSessionState(inputSessionId) {
+  const sessionId = normalizeSessionId(inputSessionId);
+  const currentSession = browserSessions.get(sessionId);
+
+  if (currentSession) {
+    return currentSession;
   }
 
-  return pagePromise;
+  return buildSessionState(sessionId);
 }
 
-async function ensureCurrentPage() {
-  const page = await getPage();
-  const currentUrl = page.url();
+async function closeSession(inputSessionId) {
+  const sessionId = normalizeSessionId(inputSessionId);
+  const currentSession = browserSessions.get(sessionId);
+
+  if (!currentSession) {
+    return false;
+  }
+
+  await currentSession.page.close().catch(() => undefined);
+  await currentSession.context.close().catch(() => undefined);
+  browserSessions.delete(sessionId);
+  return true;
+}
+
+async function ensureCurrentPage(inputSessionId) {
+  const sessionState = await getSessionState(inputSessionId);
+  const currentUrl = sessionState.page.url();
 
   if (!currentUrl || currentUrl === "about:blank") {
     throw new Error("No page is open. Call browser_open_url first.");
   }
 
   await assertSafeUrl(currentUrl);
-  return page;
+  return sessionState;
 }
 
-function truncateText(text, maxChars) {
-  if (text.length <= maxChars) {
-    return text;
+async function readLocatorText(page, selector, maxChars) {
+  const text = selector
+    ? await page.locator(selector).innerText()
+    : await page.locator("body").innerText();
+
+  return truncateText(text, maxChars);
+}
+
+async function toScreenshotPayload(page, selector, fullPage) {
+  await mkdir(screenshotDir, { recursive: true });
+
+  if (fullPage) {
+    const metrics = await page.evaluate(() => ({
+      scrollHeight: document.documentElement.scrollHeight,
+    }));
+
+    if (metrics.scrollHeight > maxPageHeight) {
+      throw new Error(`Page height exceeds screenshot limit (${maxPageHeight}px)`);
+    }
   }
 
-  return `${text.slice(0, maxChars)}\n...[truncated]`;
-}
+  const fileName = `screenshot-${Date.now()}.png`;
+  const filePath = path.join(screenshotDir, fileName);
 
-function makeTextResult(payload) {
+  if (selector) {
+    await page.locator(selector).screenshot({ path: filePath });
+  } else {
+    await page.screenshot({
+      path: filePath,
+      fullPage,
+    });
+  }
+
+  const screenshotStat = await stat(filePath);
+
+  if (screenshotStat.size > maxScreenshotBytes) {
+    throw new Error(
+      `Screenshot exceeds size limit (${maxScreenshotBytes} bytes)`
+    );
+  }
+
+  const screenshotBytes = await readFile(filePath);
+
   return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(payload, null, 2),
-      },
-    ],
-    structuredContent: payload,
+    filePath,
+    bytes: screenshotStat.size,
+    previewDataUrl: `data:image/png;base64,${screenshotBytes.toString("base64")}`,
   };
 }
 
-async function readLocatorText(page, selector) {
-  if (!selector) {
-    const text = await page.locator("body").innerText();
-    return truncateText(text, maxTextChars);
-  }
-
-  const text = await page.locator(selector).innerText();
-  return truncateText(text, maxTextChars);
-}
+const browserSessionSchema = {
+  browserSessionId: z
+    .string()
+    .optional()
+    .describe("Internal browser session id. Usually injected by runtime."),
+};
 
 server.registerTool(
   "browser_open_url",
@@ -210,21 +306,29 @@ server.registerTool(
     },
     inputSchema: {
       url: z.string().url().describe("Public http or https URL to open"),
+      ...browserSessionSchema,
     },
   },
-  async ({ url }) => {
+  async ({ url, browserSessionId }) => {
     const parsedUrl = await assertSafeUrl(url);
-    const page = await getPage();
-    const response = await page.goto(parsedUrl.toString(), {
+    const sessionState = await getSessionState(browserSessionId);
+    const response = await sessionState.page.goto(parsedUrl.toString(), {
       waitUntil: "domcontentloaded",
       timeout: timeoutMs,
     });
-    await assertSafeUrl(page.url());
+    await assertSafeUrl(sessionState.page.url());
+    const redirectCount = response ? countRedirects(response.request()) : 0;
+
+    if (redirectCount > maxRedirects) {
+      throw new Error(`Too many redirects (${redirectCount})`);
+    }
 
     return makeTextResult({
-      url: page.url(),
-      title: await page.title(),
+      sessionId: sessionState.sessionId,
+      url: sessionState.page.url(),
+      title: await sessionState.page.title(),
       status: response?.status() ?? null,
+      redirectCount,
     });
   }
 );
@@ -248,16 +352,24 @@ server.registerTool(
         .max(maxTextChars)
         .optional()
         .describe("Optional text limit override"),
+      ...browserSessionSchema,
     },
   },
-  async ({ selector, maxChars }) => {
-    const page = await ensureCurrentPage();
-    const text = await readLocatorText(page, selector?.trim() || undefined);
+  async ({ selector, maxChars, browserSessionId }) => {
+    const sessionState = await ensureCurrentPage(browserSessionId);
+    const text = await readLocatorText(
+      sessionState.page,
+      selector?.trim() || undefined,
+      maxChars ?? maxTextChars
+    );
 
     return makeTextResult({
-      url: page.url(),
+      sessionId: sessionState.sessionId,
+      url: sessionState.page.url(),
+      title: await sessionState.page.title(),
       selector: selector?.trim() || "body",
-      text: truncateText(text, maxChars ?? maxTextChars),
+      text,
+      textLength: text.length,
     });
   }
 );
@@ -281,23 +393,29 @@ server.registerTool(
         .max(maxLinkCount)
         .optional()
         .describe("Optional link count limit"),
+      ...browserSessionSchema,
     },
   },
-  async ({ selector, limit }) => {
-    const page = await ensureCurrentPage();
+  async ({ selector, limit, browserSessionId }) => {
+    const sessionState = await ensureCurrentPage(browserSessionId);
     const scope = selector?.trim() ? `${selector.trim()} a` : "a";
-    const links = await page.locator(scope).evaluateAll((elements, maxCount) =>
-      elements.slice(0, maxCount).map((element) => ({
-        text: element.textContent?.trim() ?? "",
-        href: element.href,
-      })),
-      limit ?? maxLinkCount
-    );
+    const links = await sessionState.page
+      .locator(scope)
+      .evaluateAll((elements, maxCount) =>
+        elements.slice(0, maxCount).map((element) => ({
+          text: element.textContent?.trim() ?? "",
+          href: element.href,
+        })),
+        limit ?? maxLinkCount
+      );
 
     return makeTextResult({
-      url: page.url(),
+      sessionId: sessionState.sessionId,
+      url: sessionState.page.url(),
+      title: await sessionState.page.title(),
       selector: selector?.trim() || null,
       links,
+      linksCount: links.length,
     });
   }
 );
@@ -318,27 +436,24 @@ server.registerTool(
         .boolean()
         .optional()
         .describe("Whether to capture the full page"),
+      ...browserSessionSchema,
     },
   },
-  async ({ selector, fullPage = true }) => {
-    const page = await ensureCurrentPage();
-    await mkdir(screenshotDir, { recursive: true });
-    const fileName = `screenshot-${Date.now()}.png`;
-    const filePath = path.join(screenshotDir, fileName);
-
-    if (selector?.trim()) {
-      await page.locator(selector.trim()).screenshot({ path: filePath });
-    } else {
-      await page.screenshot({
-        path: filePath,
-        fullPage,
-      });
-    }
+  async ({ selector, fullPage = true, browserSessionId }) => {
+    const sessionState = await ensureCurrentPage(browserSessionId);
+    const screenshot = await toScreenshotPayload(
+      sessionState.page,
+      selector?.trim() || undefined,
+      fullPage
+    );
 
     return makeTextResult({
-      url: page.url(),
+      sessionId: sessionState.sessionId,
+      url: sessionState.page.url(),
+      title: await sessionState.page.title(),
       selector: selector?.trim() || null,
-      filePath,
+      fullPage,
+      ...screenshot,
     });
   }
 );
@@ -352,21 +467,22 @@ server.registerTool(
     },
     inputSchema: {
       selector: z.string().describe("CSS selector to click"),
+      ...browserSessionSchema,
     },
   },
-  async ({ selector }) => {
-    const page = await ensureCurrentPage();
-    const locator = page.locator(selector);
-    await locator.click({ timeout: timeoutMs });
-    await page.waitForLoadState("domcontentloaded", { timeout: timeoutMs }).catch(
-      () => undefined
-    );
-    await assertSafeUrl(page.url());
+  async ({ selector, browserSessionId }) => {
+    const sessionState = await ensureCurrentPage(browserSessionId);
+    await sessionState.page.locator(selector).click({ timeout: timeoutMs });
+    await sessionState.page
+      .waitForLoadState("domcontentloaded", { timeout: timeoutMs })
+      .catch(() => undefined);
+    await assertSafeUrl(sessionState.page.url());
 
     return makeTextResult({
-      url: page.url(),
+      sessionId: sessionState.sessionId,
+      url: sessionState.page.url(),
+      title: await sessionState.page.title(),
       selector,
-      title: await page.title(),
     });
   }
 );
@@ -385,12 +501,12 @@ server.registerTool(
         .boolean()
         .optional()
         .describe("Whether to clear the input before typing"),
+      ...browserSessionSchema,
     },
   },
-  async ({ selector, text, clearFirst = true }) => {
-    const page = await ensureCurrentPage();
-    const locator = page.locator(selector);
-
+  async ({ selector, text, clearFirst = true, browserSessionId }) => {
+    const sessionState = await ensureCurrentPage(browserSessionId);
+    const locator = sessionState.page.locator(selector);
     await locator.click({ timeout: timeoutMs });
 
     if (clearFirst) {
@@ -400,7 +516,9 @@ server.registerTool(
     await locator.type(text, { timeout: timeoutMs });
 
     return makeTextResult({
-      url: page.url(),
+      sessionId: sessionState.sessionId,
+      url: sessionState.page.url(),
+      title: await sessionState.page.title(),
       selector,
       typedLength: text.length,
     });
@@ -418,11 +536,12 @@ server.registerTool(
       selector: z
         .string()
         .describe("CSS selector for a form or submit control"),
+      ...browserSessionSchema,
     },
   },
-  async ({ selector }) => {
-    const page = await ensureCurrentPage();
-    const locator = page.locator(selector);
+  async ({ selector, browserSessionId }) => {
+    const sessionState = await ensureCurrentPage(browserSessionId);
+    const locator = sessionState.page.locator(selector);
     const elementTag = await locator.evaluate((element) => element.tagName);
 
     if (typeof elementTag === "string" && elementTag.toLowerCase() === "form") {
@@ -435,15 +554,61 @@ server.registerTool(
       await locator.click({ timeout: timeoutMs });
     }
 
-    await page.waitForLoadState("domcontentloaded", { timeout: timeoutMs }).catch(
-      () => undefined
-    );
-    await assertSafeUrl(page.url());
+    await sessionState.page
+      .waitForLoadState("domcontentloaded", { timeout: timeoutMs })
+      .catch(() => undefined);
+    await assertSafeUrl(sessionState.page.url());
 
     return makeTextResult({
-      url: page.url(),
+      sessionId: sessionState.sessionId,
+      url: sessionState.page.url(),
+      title: await sessionState.page.title(),
       selector,
-      title: await page.title(),
+    });
+  }
+);
+
+server.registerTool(
+  "browser_reset_session",
+  {
+    description: "Reset the browser session context for the current conversation.",
+    annotations: {
+      readOnlyHint: true,
+    },
+    inputSchema: {
+      ...browserSessionSchema,
+    },
+  },
+  async ({ browserSessionId }) => {
+    const sessionId = normalizeSessionId(browserSessionId);
+    await closeSession(sessionId);
+    await buildSessionState(sessionId);
+
+    return makeTextResult({
+      sessionId,
+      reset: true,
+    });
+  }
+);
+
+server.registerTool(
+  "browser_close_session",
+  {
+    description: "Close the browser session context for the current conversation.",
+    annotations: {
+      readOnlyHint: true,
+    },
+    inputSchema: {
+      ...browserSessionSchema,
+    },
+  },
+  async ({ browserSessionId }) => {
+    const sessionId = normalizeSessionId(browserSessionId);
+    const closed = await closeSession(sessionId);
+
+    return makeTextResult({
+      sessionId,
+      closed,
     });
   }
 );

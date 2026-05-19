@@ -88,6 +88,8 @@ function toToolRiskLevel(name: string): ToolRiskLevel {
     name.startsWith("browser_click") ||
     name.startsWith("browser_type") ||
     name.startsWith("browser_submit") ||
+    name.startsWith("browser_reset") ||
+    name.startsWith("browser_close") ||
     name.startsWith("github_create") ||
     name.startsWith("github_comment") ||
     name.startsWith("github_pr")
@@ -125,7 +127,9 @@ function toToolPermissions(name: string): ToolPermission[] {
   if (
     name.startsWith("browser_click") ||
     name.startsWith("browser_type") ||
-    name.startsWith("browser_submit")
+    name.startsWith("browser_submit") ||
+    name.startsWith("browser_reset") ||
+    name.startsWith("browser_close")
   ) {
     return ["execute"];
   }

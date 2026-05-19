@@ -21,6 +21,12 @@ type SessionResponse = {
 
 type ConfirmationDecision = "approved" | "rejected";
 
+type PatchActionResponse = {
+    ok: boolean;
+    result?: unknown;
+    error?: string;
+};
+
 function createMessage(role: ChatMessage["role"], content: string): ChatMessage {
     // 创建一个新的聊天消息对象
     return {
@@ -519,6 +525,93 @@ export function ChatWindow() {
             setIsLoading(false);
         }
     }
+
+    async function handlePatchProposalAction(
+        message: ChatMessage,
+        action: "apply" | "reject",
+        files?: Array<{ path: string; content: string }>
+    ) {
+        if (isLoading || !sessionId) {
+            return;
+        }
+
+        const proposalId =
+            message.toolResult &&
+            typeof message.toolResult === "object" &&
+            typeof (message.toolResult as Record<string, unknown>).proposalId === "string"
+                ? ((message.toolResult as Record<string, unknown>).proposalId as string)
+                : null;
+
+        if (!proposalId) {
+            return;
+        }
+
+        setIsLoading(true);
+        setMessages((prev) =>
+            prev.map((item) =>
+                item.id === message.id
+                    ? {
+                        ...item,
+                        toolStatus: "running",
+                        toolError: undefined,
+                    }
+                    : item
+            )
+        );
+
+        try {
+            const response = await fetch("/api/chat", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    sessionId,
+                    useLangGraph: USE_LANGGRAPH,
+                    patchAction: {
+                        action,
+                        proposalId,
+                        files,
+                    },
+                }),
+            });
+
+            const data = (await response.json()) as PatchActionResponse;
+
+            if (!response.ok || !data.ok) {
+                throw new Error(data.error ?? `Patch action failed with status ${response.status}`);
+            }
+
+            setMessages((prev) =>
+                prev.map((item) =>
+                    item.id === message.id
+                        ? {
+                            ...item,
+                            toolStatus: "success",
+                            toolResult: data.result,
+                        }
+                        : item
+                )
+            );
+        } catch (error) {
+            const errorMessage =
+                error instanceof Error ? error.message : "Patch action failed";
+
+            setMessages((prev) =>
+                prev.map((item) =>
+                    item.id === message.id
+                        ? {
+                            ...item,
+                            toolStatus: "error",
+                            toolError: errorMessage,
+                        }
+                        : item
+                )
+            );
+        } finally {
+            setIsLoading(false);
+        }
+    }
     // 渲染聊天窗口，展示消息列表和消息输入组件
     return (
         <main className="mx-auto flex h-screen max-w-3xl flex-col">
@@ -536,6 +629,12 @@ export function ChatWindow() {
                         }
                         onRejectTool={(toolMessage) =>
                             void handleToolConfirmation(toolMessage, "rejected")
+                        }
+                        onApprovePatch={(toolMessage, files) =>
+                            void handlePatchProposalAction(toolMessage, "apply", files)
+                        }
+                        onRejectPatch={(toolMessage) =>
+                            void handlePatchProposalAction(toolMessage, "reject")
                         }
                     />
                 ))}

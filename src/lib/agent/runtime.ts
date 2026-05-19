@@ -13,6 +13,7 @@ import {
 type RuntimeMessage = ProviderMessage;
 type RuntimeOptions = {
   onFinish?: (messages: RuntimeMessage[]) => void;
+  sessionId?: string;
 };
 
 const MAX_STEPS_ERROR_MESSAGE = "Agent Runtime Error";
@@ -74,7 +75,7 @@ export async function runAgentRuntime(
   messages: RuntimeMessage[],
   options: RuntimeOptions = {}
 ) {
-  const state = createAgentState(messages);
+  const state = createAgentState(messages, undefined, options.sessionId ?? null);
 
   return new ReadableStream({
     async start(controller) {

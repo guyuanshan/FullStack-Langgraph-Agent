@@ -20,6 +20,17 @@ const DANGEROUS_BROWSER_PATTERNS = [
   /destroy/i,
   /unsubscribe/i,
 ];
+const HIGH_RISK_BROWSER_DOMAINS = (
+  process.env.BROWSER_HIGH_RISK_DOMAINS ??
+  "accounts.google.com,login.microsoftonline.com,github.com,checkout.stripe.com,paypal.com"
+)
+  .split(",")
+  .map((value) => value.trim().toLowerCase())
+  .filter(Boolean);
+
+function matchesHostname(hostname: string, domain: string) {
+  return hostname === domain || hostname.endsWith(`.${domain}`);
+}
 
 function shouldElevateBrowserRisk(args: Record<string, unknown>) {
   const values = [
@@ -38,11 +49,34 @@ function shouldElevateBrowserRisk(args: Record<string, unknown>) {
   );
 }
 
+function isHighRiskBrowserDomain(args: Record<string, unknown>) {
+  if (typeof args.url !== "string") {
+    return false;
+  }
+
+  try {
+    const hostname = new URL(args.url).hostname.toLowerCase();
+    return HIGH_RISK_BROWSER_DOMAINS.some((domain) =>
+      matchesHostname(hostname, domain)
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function resolveToolRiskLevel(
   tool: ToolDefinition | undefined,
   args: Record<string, unknown>
 ): ToolRiskLevel {
   const baseRiskLevel = tool?.riskLevel ?? "safe";
+
+  if (
+    tool?.name &&
+    tool.name === "browser_open_url" &&
+    isHighRiskBrowserDomain(args)
+  ) {
+    return "confirm_required";
+  }
 
   if (
     tool?.name &&

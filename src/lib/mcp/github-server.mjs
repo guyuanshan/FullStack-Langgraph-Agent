@@ -298,6 +298,55 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "github_create_pr",
+  {
+    description: "Create a new GitHub pull request in a repository.",
+    annotations: {
+      destructiveHint: true,
+    },
+    inputSchema: {
+      repo: z.string().describe("GitHub repo in owner/name format"),
+      title: z.string().describe("Pull request title"),
+      head: z
+        .string()
+        .describe("Head branch name, for example codex/my-change"),
+      base: z.string().optional().describe("Base branch, defaults to repo default branch"),
+      body: z.string().optional().describe("Pull request body in Markdown"),
+      draft: z.boolean().optional().describe("Whether to create a draft PR"),
+    },
+  },
+  async ({ repo: inputRepo, title, head, base, body, draft = false }) => {
+    const repo = normalizeRepo(inputRepo);
+    const pullRequest = await fetchGitHubJson(
+      `/repos/${repo}/pulls`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          title,
+          head,
+          base,
+          body,
+          draft,
+        }),
+      },
+      true
+    );
+
+    return makeTextResult({
+      repo,
+      number: pullRequest.number,
+      title: pullRequest.title,
+      state: pullRequest.state,
+      draft: pullRequest.draft,
+      htmlUrl: pullRequest.html_url,
+      url: pullRequest.html_url,
+      head: pullRequest.head?.ref ?? head,
+      base: pullRequest.base?.ref ?? base ?? null,
+    });
+  }
+);
+
 const transport = new StdioServerTransport();
 
 await server.connect(transport);

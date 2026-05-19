@@ -9,6 +9,10 @@ import {
   setSessionMessages,
   type SessionMessage,
 } from "../../../lib/chat/session-store";
+import {
+  applyPatchProposal,
+  rejectPatchProposal,
+} from "../../../lib/code-agent/proposals";
 
 type ClientMessage = {
   role: "user" | "assistant";
@@ -18,6 +22,16 @@ type ClientMessage = {
 type ConfirmationRequest = {
   decision: "approved" | "rejected";
   reason?: string;
+};
+
+type PatchActionRequest = {
+  action: "apply" | "reject";
+  proposalId: string;
+  reason?: string;
+  files?: Array<{
+    path: string;
+    content: string;
+  }>;
 };
 
 function isClientMessage(value: unknown): value is ClientMessage {
@@ -114,6 +128,7 @@ export async function POST(req: Request) {
   const messages = body.messages;
   const useLangGraph = body.useLangGraph === true;
   const confirmation = body.confirmation;
+  const patchAction = body.patchAction;
 
   if (typeof sessionId !== "string" || sessionId.trim() === "") {
     return Response.json(
@@ -167,6 +182,62 @@ export async function POST(req: Request) {
     });
   }
 
+  if (patchAction && typeof patchAction === "object") {
+    const actionPayload = patchAction as PatchActionRequest;
+
+    if (
+      (actionPayload.action !== "apply" && actionPayload.action !== "reject") ||
+      typeof actionPayload.proposalId !== "string" ||
+      actionPayload.proposalId.trim() === ""
+    ) {
+      return Response.json(
+        {
+          error:
+            "Invalid patchAction payload. Expected { action: 'apply' | 'reject', proposalId }",
+          received: body,
+        },
+        { status: 400 }
+      );
+    }
+
+    try {
+      const result =
+        actionPayload.action === "apply"
+          ? await applyPatchProposal({
+              proposalId: actionPayload.proposalId,
+              files: Array.isArray(actionPayload.files)
+                ? actionPayload.files.filter(
+                    (file): file is { path: string; content: string } =>
+                      !!file &&
+                      typeof file === "object" &&
+                      typeof file.path === "string" &&
+                      typeof file.content === "string"
+                  )
+                : undefined,
+            })
+          : await rejectPatchProposal({
+              proposalId: actionPayload.proposalId,
+              reason:
+                typeof actionPayload.reason === "string"
+                  ? actionPayload.reason
+                  : undefined,
+            });
+
+      return Response.json({
+        ok: true,
+        result,
+      });
+    } catch (error) {
+      return Response.json(
+        {
+          ok: false,
+          error: error instanceof Error ? error.message : "Unknown patch action error",
+        },
+        { status: 400 }
+      );
+    }
+  }
+
   if (!Array.isArray(messages)) {
     return Response.json(
       {
@@ -205,6 +276,7 @@ export async function POST(req: Request) {
         },
       })
     : await runAgentRuntime(sessionMessages, {
+        sessionId,
         onFinish(nextMessages) {
           setSessionMessages(sessionId, nextMessages);
         },

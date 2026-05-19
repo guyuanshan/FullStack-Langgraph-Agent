@@ -1,5 +1,17 @@
 import { weatherTool } from "./weather";
 import { writeDemoFileTool } from "./write-demo-file";
+import {
+  codeProposePatchTool,
+  gitCommitChangesTool,
+  gitCreateBranchTool,
+  gitPreparePrSummaryTool,
+  gitPushBranchTool,
+  gitStatusSummaryTool,
+  projectReadFilesTool,
+  projectSearchTool,
+  projectSummaryTool,
+  runProjectChecksTool,
+} from "./code-agent";
 import { getMcpProviderTools, getMcpTools } from "../mcp/client";
 import type {
   ToolArgs,
@@ -38,7 +50,20 @@ export function registerTools(tools: ToolDefinition[]) { // 注册工具并返�
   };
 }
 
-export const localToolRegistry = registerTools([weatherTool, writeDemoFileTool]); // 在这里注册本地工具，目前包含天气工具和一个需要确认的写文件工具
+export const localToolRegistry = registerTools([
+  weatherTool,
+  writeDemoFileTool,
+  projectSummaryTool,
+  projectSearchTool,
+  projectReadFilesTool,
+  codeProposePatchTool,
+  runProjectChecksTool,
+  gitStatusSummaryTool,
+  gitCreateBranchTool,
+  gitCommitChangesTool,
+  gitPushBranchTool,
+  gitPreparePrSummaryTool,
+]); // 在这里注册本地工具，包含基础工具和 code agent 能力
 
 export const registeredTools = localToolRegistry.tools; // 导出已注册的本地工具列表
 

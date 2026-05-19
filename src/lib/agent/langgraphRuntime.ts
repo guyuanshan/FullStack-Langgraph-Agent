@@ -49,9 +49,14 @@ function enqueueEvents(
 
 function toRuntimeGraphState(
   values: unknown,
-  fallbackMessages: RuntimeMessage[]
+  fallbackMessages: RuntimeMessage[],
+  threadId: string
 ): RuntimeGraphState {
-  const defaults = createAgentState(structuredClone(fallbackMessages));
+  const defaults = createAgentState(
+    structuredClone(fallbackMessages),
+    undefined,
+    threadId
+  );
 
   if (!values || typeof values !== "object") {
     return defaults;
@@ -78,9 +83,9 @@ async function loadLatestThreadState(
 ) {
   try {
     const snapshot = await getRuntimeThreadState(threadId);
-    return toRuntimeGraphState(snapshot.values, fallbackMessages);
+    return toRuntimeGraphState(snapshot.values, fallbackMessages, threadId);
   } catch {
-    return createAgentState(structuredClone(fallbackMessages));
+    return createAgentState(structuredClone(fallbackMessages), undefined, threadId);
   }
 }
 
@@ -90,13 +95,15 @@ async function streamLangGraphInput(
 ) {
   const inputMessages = Array.isArray(input) ? input : [];
   const graphInput = Array.isArray(input)
-    ? createAgentState(structuredClone(input))
+    ? createAgentState(structuredClone(input), undefined, options.threadId)
     : input;
 
   return new ReadableStream({
     async start(controller) {
       let latestState: RuntimeGraphState = createAgentState(
-        structuredClone(inputMessages)
+        structuredClone(inputMessages),
+        undefined,
+        options.threadId
       );
 
       try {

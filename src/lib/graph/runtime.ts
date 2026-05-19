@@ -29,6 +29,7 @@ const memorySaver = new MemorySaver();
 
 function cloneAgentState(state: GraphAgentState): AgentState {
   return {
+    sessionId: state.sessionId,
     messages: structuredClone(state.messages),
     step: state.step,
     maxSteps: state.maxSteps,
@@ -79,10 +80,12 @@ async function runToolsDraft(state: GraphAgentState) { // 执行工具节点的�
         toolName,
         toolCallId: toolCall.id,
         source: tool?.source,
+        url: typeof args.url === "string" ? args.url : undefined,
         riskLevel,
         permissions,
         args,
         outcome: "interrupted",
+        resultSummary: toolSummary,
         detail: message,
       });
 
@@ -115,10 +118,12 @@ async function runToolsDraft(state: GraphAgentState) { // 执行工具节点的�
           toolName,
           toolCallId: toolCall.id,
           source: tool?.source,
+          url: typeof args.url === "string" ? args.url : undefined,
           riskLevel,
           permissions,
           args,
           outcome: "denied",
+          resultSummary: toolSummary,
           detail:
             decision?.reason ?? `User denied tool execution: ${toolName}`,
         });
@@ -177,11 +182,14 @@ export async function invokeRuntimeStateGraph(
   messages: ProviderMessage[],
   threadId = "draft-thread"
 ) { // 调用运行时状态图的函数，接受消息作为输入，创建状态图并执行
-  return runtimeStateGraph.invoke(createAgentState(structuredClone(messages)), {
+  return runtimeStateGraph.invoke(
+    createAgentState(structuredClone(messages), undefined, threadId),
+    {
     configurable: {
       thread_id: threadId,
     },
-  });
+    }
+  );
 }
 
 export async function getRuntimeThreadState(threadId: string) {

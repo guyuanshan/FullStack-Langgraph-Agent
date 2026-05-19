@@ -11,6 +11,7 @@ export type ToolAuditEntry = { // 这里的设计是为了记录工具调用的�
   toolName: string;// toolName 字段记录了被调用的工具的名称
   toolCallId?: string;// toolCallId 字段是一个可选字段，用于唯一标识一次工具调用，方便后续的追踪和分析
   source?: "local" | "mcp"; // source 字段是一个可选字段，用于记录工具调用的来源，可以是 "local"（本地调用）或者 "mcp"（通过 MCP 调用） 
+  url?: string;
   riskLevel?: ToolRiskLevel;
   permissions?: ToolPermission[];
   args?: ToolArgs;
@@ -20,6 +21,7 @@ export type ToolAuditEntry = { // 这里的设计是为了记录工具调用的�
     | "error"
     | "interrupted"
     | "denied";
+  resultSummary?: string;
   detail?: string;// detail 字段是一个可选字段，用于记录工具调用的详细结果或错误信息，提供更多上下文以便后续分析和调试
 };
 
