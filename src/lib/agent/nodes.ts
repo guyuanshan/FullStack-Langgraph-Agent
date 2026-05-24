@@ -4,7 +4,16 @@ import type {
   ProviderToolCallDelta,
 } from "../../lib/ai/providers/types";
 import { appendToolAuditLog } from "../../lib/audit/log";
+import { ensureSession } from "../../lib/chat";
+import {
+  appendModelCall,
+  estimateTokenCount,
+} from "../../lib/observability/store";
 import { executeTool, getProviderTools, getTool } from "../../lib/tools";
+import {
+  updateToolCallOutcome,
+  upsertToolCallStart,
+} from "../../lib/tools/tool-call-store";
 import {
   resolveToolPermissions,
   resolveToolRiskLevel,
@@ -75,9 +84,44 @@ function markNode(state: AgentState, node: AgentExecutableNode) { // 标记当�
 }
 
 export function parseToolCallArgs(toolCall: ProviderToolCall) {
-  return JSON.parse(
-    toolCall.function.arguments || "{}"
-  ) as Record<string, unknown>;
+  const rawArguments = toolCall.function.arguments || "{}";
+
+  const tryParse = (value: string) => {
+    const parsed = JSON.parse(value) as unknown;
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+
+    return parsed as Record<string, unknown>;
+  };
+
+  try {
+    return tryParse(rawArguments);
+  } catch {
+    const repairedArguments = rawArguments
+      .trim()
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .replace(/[“”]/g, '"')
+      .replace(/[‘’]/g, "'")
+      .replace(/([{,]\s*)([A-Za-z0-9_]+)\s*:/g, '$1"$2":')
+      .replace(/:\s*'([^']*)'/g, ': "$1"')
+      .replace(/,\s*([}\]])/g, "$1");
+
+    try {
+      return tryParse(repairedArguments);
+    } catch (error) {
+      console.error("Failed to parse tool call arguments", {
+        toolName: toolCall.function.name,
+        rawArguments,
+        repairedArguments,
+        error,
+      });
+      return {};
+    }
+  }
 }
 
 export function hasToolMessage(
@@ -142,13 +186,18 @@ export async function executeSingleToolCall(
   toolCall: ProviderToolCall,
   args = parseToolCallArgs(toolCall)
 ) {
+  const startedAt = Date.now();
   const name = toolCall.function.name;
   const tool = await getTool(name);
   const toolSummary = summarizeToolArgs(args);
   const toolRiskLevel = resolveToolRiskLevel(tool, args);
   const toolPermissions = resolveToolPermissions(tool);
+  const progressEnabled =
+    name === "project_memory_index" || name === "project_memory_refresh";
   const executionArgs =
-    (name.startsWith("browser_") || name === "code_propose_patch") &&
+    (name.startsWith("browser_") ||
+      name === "code_propose_patch" ||
+      progressEnabled) &&
     state.sessionId
       ? {
           ...args,
@@ -158,11 +207,33 @@ export async function executeSingleToolCall(
           ...(name === "code_propose_patch"
             ? { agentSessionId: state.sessionId }
             : {}),
+          ...(progressEnabled
+            ? {
+                __progress: (progress: {
+                  phase: "scanning" | "embedding";
+                  completed: number;
+                  total: number;
+                  chunkKey?: string;
+                  sourcePath?: string | null;
+                }) => {
+                  state.events.push({
+                    type: "tool_progress",
+                    toolName: name,
+                    toolCallId: toolCall.id,
+                    progress,
+                  });
+                },
+              }
+            : {}),
         }
       : args;
 
   console.log(`[agent step ${state.step}] tool name:`, name);
   console.log(`[agent step ${state.step}] tool args:`, args);
+
+  if (state.sessionId) {
+    await ensureSession(state.sessionId);
+  }
 
   state.events.push({
     type: "tool_start",
@@ -174,8 +245,20 @@ export async function executeSingleToolCall(
     toolPermissions,
   });
 
+  await upsertToolCallStart({
+    sessionId: state.sessionId,
+    runId: state.runId,
+    stepId: state.activeStepId,
+    toolCallId: toolCall.id ?? `${state.step}-${name}`,
+    toolName: name,
+    source: tool?.source,
+    riskLevel: toolRiskLevel,
+    permissions: toolPermissions,
+    args,
+  });
   await appendToolAuditLog({
     timestamp: new Date().toISOString(),
+    sessionId: state.sessionId ?? undefined,
     toolName: name,
     toolCallId: toolCall.id,
     source: tool?.source,
@@ -197,6 +280,7 @@ export async function executeSingleToolCall(
     }
     await appendToolAuditLog({
       timestamp: new Date().toISOString(),
+      sessionId: state.sessionId ?? undefined,
       toolName: name,
       toolCallId: toolCall.id,
       source: tool?.source,
@@ -205,8 +289,17 @@ export async function executeSingleToolCall(
       permissions: toolPermissions,
       args,
       outcome: "success",
+      latencyMs: Date.now() - startedAt,
       resultSummary: summarizeToolResult(execution.result),
       detail: JSON.stringify(execution.result),
+    });
+    await updateToolCallOutcome({
+      sessionId: state.sessionId,
+      toolCallId: toolCall.id ?? `${state.step}-${name}`,
+      status: "success",
+      resultSummary: summarizeToolResult(execution.result),
+      result: execution.result,
+      estimatedCostUsd: 0,
     });
     return;
   }
@@ -219,6 +312,7 @@ export async function executeSingleToolCall(
   }
   await appendToolAuditLog({
     timestamp: new Date().toISOString(),
+    sessionId: state.sessionId ?? undefined,
     toolName: name,
     toolCallId: toolCall.id,
     source: tool?.source,
@@ -227,8 +321,17 @@ export async function executeSingleToolCall(
     permissions: toolPermissions,
     args,
     outcome: "error",
+    latencyMs: Date.now() - startedAt,
     resultSummary: message,
     detail: message,
+  });
+  await updateToolCallOutcome({
+    sessionId: state.sessionId,
+    toolCallId: toolCall.id ?? `${state.step}-${name}`,
+    status: "error",
+    resultSummary: message,
+    errorMessage: message,
+    estimatedCostUsd: 0,
   });
   console.log(`[agent step ${state.step}] tool error:`, message);
 }
@@ -246,27 +349,77 @@ export function flushStateEvents(
 
 export async function callModelNode(state: AgentState): Promise<AgentState> { // 调用模型节点的函数，处理与模型交互的逻辑
   const provider = getDefaultChatProvider();
+  const startedAt = Date.now();
+  const promptTokenEstimate = estimateTokenCount(state.messages);
 
   resetStepState(state);
   state.step += 1;
   markNode(state, "model");
   const providerTools = await getProviderTools();
 
-  const chatStream = await provider.createChatStream(state.messages, {
-    tools: [...providerTools],
-  });
+  try {
+    const chatStream = await provider.createChatStream(state.messages, {
+      tools: [...providerTools],
+    });
 
-  for await (const event of chatStream.events) {
-    if (event.type === "tool_call_delta") {
-      collectToolCall(state.toolCalls, event.toolCall);
-      continue;
+    for await (const event of chatStream.events) {
+      if (event.type === "tool_call_delta") {
+        collectToolCall(state.toolCalls, event.toolCall);
+        continue;
+      }
+
+      state.assistantContent += event.text;
     }
 
-    state.assistantContent += event.text;
-  }
+    state.assistantMessage = chatStream.getAssistantMessage();
+    extractAssistantState(state);
 
-  state.assistantMessage = chatStream.getAssistantMessage();
-  extractAssistantState(state);
+    if (state.runId) {
+      await appendModelCall({
+        runId: state.runId,
+        stepId: state.activeStepId,
+        sessionId: state.sessionId,
+        agentName: "assistant",
+        nodeName: "callModelNode",
+        provider: provider.providerName ?? "unknown",
+        model: provider.modelName ?? "unknown",
+        promptTokens: promptTokenEstimate,
+        completionTokens: estimateTokenCount(state.assistantContent),
+        reasoningTokens: estimateTokenCount(state.reasoningContent),
+        latencyMs: Date.now() - startedAt,
+        status: "success",
+        input: {
+          messageCount: state.messages.length,
+          toolCount: providerTools.length,
+        },
+        output: {
+          assistantContent: state.assistantContent,
+          toolCallCount: state.toolCalls.length,
+        },
+      });
+    }
+  } catch (error) {
+    if (state.runId) {
+      await appendModelCall({
+        runId: state.runId,
+        stepId: state.activeStepId,
+        sessionId: state.sessionId,
+        agentName: "assistant",
+        nodeName: "callModelNode",
+        provider: provider.providerName ?? "unknown",
+        model: provider.modelName ?? "unknown",
+        promptTokens: promptTokenEstimate,
+        latencyMs: Date.now() - startedAt,
+        status: "error",
+        input: {
+          messageCount: state.messages.length,
+          toolCount: providerTools.length,
+        },
+        errorMessage: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+    throw error;
+  }
 
   if (state.toolCalls.length === 0) {
     if (state.assistantContent) {

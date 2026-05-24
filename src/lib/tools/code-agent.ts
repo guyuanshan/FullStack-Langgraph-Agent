@@ -12,6 +12,11 @@ import {
   getGitStatusSummary,
   pushGitBranch,
 } from "../code-agent/git";
+import {
+  indexProjectMemory,
+  refreshProjectMemory,
+  retrieveProjectMemories,
+} from "../project-memory";
 import type { ToolDefinition } from "./types";
 
 export const projectSummaryTool: ToolDefinition = {
@@ -106,6 +111,132 @@ export const projectReadFilesTool: ToolDefinition = {
       paths: Array.isArray(args.paths) ? (args.paths as string[]) : [],
       maxCharsPerFile:
         typeof args.maxCharsPerFile === "number" ? args.maxCharsPerFile : undefined,
+    });
+  },
+};
+
+export const projectMemoryIndexTool: ToolDefinition = {
+  name: "project_memory_index",
+  description:
+    "Scan the current project, chunk important files and docs, generate embeddings, and persist project-level memory for future retrieval.",
+  source: "local",
+  permissions: ["read"],
+  parameters: {
+    type: "object",
+    properties: {
+      embeddingProvider: {
+        type: "string",
+        enum: ["local", "openai", "gemini"],
+        description: "Optional embedding backend override",
+      },
+    },
+  },
+  async execute(args) {
+    const onProgress =
+      typeof args.__progress === "function"
+        ? (args.__progress as (event: {
+            phase: "scanning" | "embedding";
+            completed: number;
+            total: number;
+            chunkKey?: string;
+            sourcePath?: string | null;
+          }) => void)
+        : undefined;
+
+    return indexProjectMemory({
+      embeddingProvider:
+        typeof args.embeddingProvider === "string"
+          ? args.embeddingProvider
+          : undefined,
+      onProgress,
+    });
+  },
+};
+
+export const projectMemorySearchTool: ToolDefinition = {
+  name: "project_memory_search",
+  description:
+    "Search project-level long-term memory using semantic similarity. Useful for tech stack, architecture, prior fixes, and related code chunks.",
+  source: "local",
+  permissions: ["read"],
+  parameters: {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        description: "Question or retrieval query",
+      },
+      topK: {
+        type: "number",
+        description: "Maximum number of memories to return",
+      },
+      embeddingProvider: {
+        type: "string",
+        enum: ["local", "openai", "gemini"],
+        description: "Optional embedding backend override",
+      },
+    },
+    required: ["query"],
+  },
+  async execute(args) {
+    if (typeof args.query !== "string") {
+      throw new Error("Tool project_memory_search requires a string query");
+    }
+
+    return retrieveProjectMemories({
+      query: args.query,
+      topK: typeof args.topK === "number" ? args.topK : undefined,
+      embeddingProvider:
+        typeof args.embeddingProvider === "string"
+          ? args.embeddingProvider
+          : undefined,
+    });
+  },
+};
+
+export const projectMemoryRefreshTool: ToolDefinition = {
+  name: "project_memory_refresh",
+  description:
+    "Refresh project memory for a specific set of changed files after edits, replacing old embeddings for those paths.",
+  source: "local",
+  permissions: ["read"],
+  parameters: {
+    type: "object",
+    properties: {
+      paths: {
+        type: "array",
+        items: {
+          type: "string",
+        },
+        description: "Relative file paths to re-index",
+      },
+      embeddingProvider: {
+        type: "string",
+        enum: ["local", "openai", "gemini"],
+        description: "Optional embedding backend override",
+      },
+    },
+    required: ["paths"],
+  },
+  async execute(args) {
+    const onProgress =
+      typeof args.__progress === "function"
+        ? (args.__progress as (event: {
+            phase: "scanning" | "embedding";
+            completed: number;
+            total: number;
+            chunkKey?: string;
+            sourcePath?: string | null;
+          }) => void)
+        : undefined;
+
+    return refreshProjectMemory({
+      paths: Array.isArray(args.paths) ? (args.paths as string[]) : [],
+      embeddingProvider:
+        typeof args.embeddingProvider === "string"
+          ? args.embeddingProvider
+          : undefined,
+      onProgress,
     });
   },
 };

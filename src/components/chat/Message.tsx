@@ -24,6 +24,7 @@ export function Message({
     const isUser = message.role === "user";
     const isTool = message.role === "tool";
     const isError = message.role === "error";
+    const isAgent = message.role === "agent";
 
     if (isTool) {
       return (
@@ -35,6 +36,26 @@ export function Message({
             onApprovePatch={onApprovePatch}
             onRejectPatch={onRejectPatch}
           />
+        </div>
+      );
+    }
+
+    if (isAgent) {
+      return (
+        <div className="flex justify-start">
+          <div className="max-w-[80%] rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm text-indigo-950 shadow-sm">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-indigo-500">
+              {message.agentName ?? "agent"} · {message.agentPhase ?? "status"}
+            </p>
+            <p className="mt-1 whitespace-pre-wrap leading-6">{message.content}</p>
+            {message.latencyMs || message.toolCount ? (
+              <p className="mt-2 text-xs text-indigo-600">
+                {message.latencyMs ? `Latency: ${message.latencyMs}ms` : ""}
+                {message.latencyMs && message.toolCount !== undefined ? " · " : ""}
+                {message.toolCount !== undefined ? `Tools: ${message.toolCount}` : ""}
+              </p>
+            ) : null}
+          </div>
         </div>
       );
     }

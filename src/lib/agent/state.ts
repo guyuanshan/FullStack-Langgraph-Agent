@@ -10,6 +10,8 @@ export type AgentExecutableNode = Exclude<AgentNodeName, "done">;
 export type AgentCompletionReason = "completed" | "max_steps" | "error" | null;
 
 export type AgentState = { // 代理状态类型定义
+  runId: string | null;
+  activeStepId: string | null;
   sessionId: string | null; // 当前会话 ID，用于为工具注入会话级上下文
   messages: ProviderMessage[]; // 代理对话消息列表
   step: number; // 当前步骤数
@@ -27,9 +29,12 @@ export type AgentState = { // 代理状态类型定义
 export function createAgentState( // 创建初始代理状态
   messages: ProviderMessage[],
   maxSteps = DEFAULT_MAX_STEPS,
-  sessionId: string | null = null
+  sessionId: string | null = null,
+  runId: string | null = null
 ): AgentState {
   return {
+    runId,
+    activeStepId: null,
     sessionId,
     messages,
     step: 0,

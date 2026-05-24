@@ -1,126 +1,175 @@
 # Fullstack LangGraph Agent
 
-一个基于 Next.js 16、LangGraph、MCP 和流式聊天 UI 的实验性 Agent 项目。
+一个面向“开发任务执行”的全栈 Agent 实验项目。  
+它不是只做聊天 UI，而是把多 Agent Runtime、MCP 工具系统、Human-in-the-loop、安全策略、长期记忆、项目级 RAG、代码补丁工作流和可观测性串成一条完整链路。
 
-这个项目的目标不是只做一个“会聊天的页面”，而是把一条完整的 Agent Runtime 路径搭起来：
+当前项目已经具备这些核心能力：
 
-- 模型推理
-- 工具调用
-- Human-in-the-loop 确认
-- LangGraph checkpoint 恢复
-- MCP 工具扩展
-- 审计日志
+- 多 Agent 协作：`Planner -> Executor -> Reviewer -> Finalizer`
+- LangGraph Runtime 与旧手写 Runtime 并存
+- Filesystem / GitHub / Browser MCP 接入
+- 高风险工具确认与恢复执行
+- Prisma + SQLite 持久化
+- Conversation Summary Memory
+- Project Memory / RAG
+- Code Agent Patch Proposal / 审批写入
+- Agent Observability / Trace System
 
-当前已经接入了本地工具、Filesystem MCP、GitHub MCP 和 Browser MCP，并保留了旧的手写 Runtime 作为对照实现。
+## Tech Stack
 
-## Features
+- `Next.js 16`
+- `React 19`
+- `TypeScript 5`
+- `LangGraph`
+- `Prisma`
+- `SQLite`
+- `MCP SDK`
+- `Playwright`
+- `OpenAI SDK`
+- `Zod`
 
-- `LangGraph Runtime`
-  - 显式节点流转：`model -> tools -> model -> done`
-  - `MemorySaver` checkpoint
-  - `thread_id = sessionId`
-- `Human-in-the-loop`
-  - 高风险工具执行前中断
-  - 前端确认卡片
-  - 确认/拒绝后 resume graph
-- `Tool Registry`
-  - 统一注册本地工具和 MCP 工具
-  - Runtime 只关心 `executeTool(name, args)`
-- `Filesystem MCP`
-  - 读文件、列目录、搜索目录
-  - 写文件、删文件前确认
-  - workspace root 限制
-  - `../` 越权拦截
-- `GitHub MCP`
-  - repo 搜索
-  - 读取 repo 文件 / 目录
-  - issues 查询
-  - create issue 前确认
-- `Browser MCP`
-  - 打开网页
-  - 读取正文
-  - 抓取链接
-  - 截图
-  - click / type / submit 前确认
-  - 内网、本地文件、危险域名拦截
-- `Audit Log`
-  - 记录工具名称、风险等级、权限、参数、执行结果
+## What This Project Does
 
-## Project Structure
+这套系统的目标是把一个 Agent 从“会回答问题”推进到“能理解项目、调用工具、生成补丁、经确认后执行，并且整个过程可追踪、可恢复”。
 
-```text
-src/
-  app/
-    api/chat/route.ts              # 聊天 API，支持 LangGraph 开关与确认恢复
-    page.tsx                       # 聊天页面入口
-  components/chat/                 # 聊天 UI、工具卡片、确认按钮
-  lib/
-    agent/                         # 手写 Runtime、LangGraph Runtime、节点逻辑
-    graph/                         # StateGraph 草稿与状态定义
-    mcp/                           # MCP client + filesystem/github/browser servers
-    tools/                         # Tool Registry、权限/风险策略、本地工具
-    audit/log.ts                   # 工具审计日志
-    chat/session-store.ts          # 本地 session store
-    stream/sse.ts                  # NDJSON / SSE 编码
-  types/chat.ts                    # 前后端共享聊天事件类型
-```
+核心能力包括：
 
-## Runtime Architecture
+- 聊天式任务输入
+- 多轮上下文与摘要记忆
+- 项目级知识检索
+- 工具调用与风险分级
+- 中断确认与恢复执行
+- 多 Agent 拆解复杂任务
+- 代码补丁预览与审批
+- 浏览器 / GitHub / 文件系统能力接入
+- 执行链路 Trace、错误复盘与成本估算
 
-当前项目里同时保留了两条 Runtime：
+## Architecture
 
-1. `src/lib/agent/runtime.ts`
-   - 旧的手写 Runtime
-   - 便于和 LangGraph 方案做对照
-
-2. `src/lib/agent/langgraphRuntime.ts`
-   - 新的 LangGraph Runtime
-   - 使用 `StateGraph`、checkpoint 和 interrupt
-
-LangGraph 的主图定义在：
-
-- `src/lib/graph/runtime.ts`
-- `src/lib/graph/state.ts`
-
-核心状态流转是：
+整体结构可以理解成：
 
 ```text
-START
-  -> callModelNode
-  -> if has toolCalls
-       executeToolsNode
-       -> if step < maxSteps
-            callModelNode
-          else
-            END
-     else
-       END
-```
-
-## Tool Architecture
-
-项目的工具链路是：
-
-```text
-Agent Runtime
+UI
+  -> Chat Route
+  -> Runtime Selector
+     -> Manual Runtime
+     -> LangGraph Runtime
+     -> Multi-Agent Runtime
   -> Tool Registry
-  -> MCP Client
-  -> MCP Server
-  -> Real Capability
+     -> Local Tools
+     -> MCP Client
+        -> Filesystem MCP
+        -> GitHub MCP
+        -> Browser MCP
+  -> Persistence
+     -> Prisma
+     -> SQLite
+  -> Memory
+     -> Conversation Summary
+     -> Project Memory / RAG
+  -> Observability
+     -> AgentRun / AgentStep / ModelCall / ToolCall / InterruptEvent / ErrorLog
 ```
 
-其中：
+## Runtime Layers
 
-- 本地工具直接在 `src/lib/tools/` 下实现
-- MCP 工具通过 `src/lib/mcp/client.ts` 聚合
-- Runtime 不感知工具来源，只按统一格式执行
+项目里目前有 3 套执行路径：
+
+### 1. Manual Runtime
+
+文件：
+
+- [src/lib/agent/runtime.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/agent/runtime.ts)
+
+特点：
+
+- 手写递归推进
+- 用于和 LangGraph 路径对照
+- 保留最直接的 `model -> tools -> done` 逻辑
+
+### 2. LangGraph Runtime
+
+文件：
+
+- [src/lib/agent/langgraphRuntime.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/agent/langgraphRuntime.ts)
+- [src/lib/graph/runtime.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/graph/runtime.ts)
+- [src/lib/graph/state.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/graph/state.ts)
+
+特点：
+
+- 显式状态图
+- 节点流转：`model -> tools -> model -> done`
+- `interrupt / resume`
+- `MemorySaver` checkpoint
+- 会话线程以 `thread_id = sessionId` 区分
+
+### 3. Multi-Agent Runtime
+
+文件：
+
+- [src/lib/multi-agent/runtime.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/multi-agent/runtime.ts)
+- [src/lib/multi-agent/router.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/multi-agent/router.ts)
+- [src/lib/multi-agent/prompts.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/multi-agent/prompts.ts)
+- [src/lib/multi-agent/state.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/multi-agent/state.ts)
+
+当前多 Agent 流程：
+
+```text
+planner
+  -> executor
+  -> reviewer
+  -> finalizer
+```
+
+支持：
+
+- 任务分类与路由
+- 计划生成
+- 子任务拆解
+- 并行子任务执行
+- reviewer 复核
+- 最终回答流式输出
+
+当前前端默认已经开启多 Agent。
+
+## Tool System
+
+工具体系统一经过 Tool Registry，Runtime 只关心：
+
+```ts
+executeTool(name, args)
+```
+
+对应目录：
+
+- [src/lib/tools](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/tools)
+- [src/lib/mcp/client.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/mcp/client.ts)
 
 ### Local Tools
 
 - `get_weather`
 - `write_demo_file`
+- `project_index_summary`
+- `project_search`
+- `project_read_files`
+- `code_propose_patch`
+- `run_project_checks`
+- `git_status_summary`
+- `git_create_branch`
+- `git_commit_changes`
+- `git_push_branch`
+- `git_prepare_pr_summary`
+- `project_memory_index`
+- `project_memory_search`
+- `project_memory_refresh`
 
-### Filesystem MCP Tools
+### Filesystem MCP
+
+Server：
+
+- [src/lib/mcp/filesystem-server.mjs](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/mcp/filesystem-server.mjs)
+
+Tools：
 
 - `fs_read_text`
 - `fs_list_dir`
@@ -128,14 +177,27 @@ Agent Runtime
 - `fs_write_text`
 - `fs_delete_file`
 
-### GitHub MCP Tools
+### GitHub MCP
+
+Server：
+
+- [src/lib/mcp/github-server.mjs](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/mcp/github-server.mjs)
+
+Tools：
 
 - `github_search_repo`
 - `github_read_file`
 - `github_list_issues`
 - `github_create_issue`
+- `github_create_pr`
 
-### Browser MCP Tools
+### Browser MCP
+
+Server：
+
+- [src/lib/mcp/browser-server.mjs](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/mcp/browser-server.mjs)
+
+Tools：
 
 - `browser_open_url`
 - `browser_get_text`
@@ -144,10 +206,17 @@ Agent Runtime
 - `browser_click`
 - `browser_type`
 - `browser_submit`
+- `browser_reset_session`
+- `browser_close_session`
 
-## Permission Model
+## Permission Model & Safety
 
-工具权限模型定义在 `src/lib/tools/types.ts`：
+权限模型定义在：
+
+- [src/lib/tools/types.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/tools/types.ts)
+- [src/lib/tools/policy.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/tools/policy.ts)
+
+权限类型：
 
 - `read`
 - `write`
@@ -162,78 +231,191 @@ Agent Runtime
 
 默认策略：
 
-- 读操作：`safe`
-- 写入 GitHub / 文件：`confirm_required`
-- 浏览器点击、输入、提交：`confirm_required`
-- 删除文件：`dangerous`
+- 读文件 / 读网页 / 查 GitHub：`safe`
+- 写文件 / 创建 issue / 浏览器 click/type/submit：`confirm_required`
+- 删除文件 / 敏感浏览器动作：`dangerous`
 
-浏览器工具还支持动态升级风险：
+### Filesystem Sandboxing
 
-- 如果参数中包含 `login`、`password`、`payment`、`delete` 等敏感关键词
-- 会自动提升为 `dangerous`
-
-## Safety Controls
-
-### Filesystem
-
-- 仅允许访问 workspace root
+- 只允许访问项目 workspace
 - 禁止绝对路径
-- 禁止 `../` 越权访问
+- 禁止 `../` 越权
 - 禁止访问 `.env` 等敏感文件
 
-### Browser
+### Browser Sandboxing
 
-- 仅允许 `http` / `https`
+- 只允许 `http / https`
 - 禁止 `file://`
-- 禁止访问 localhost / 内网地址
-- 支持 domain allowlist / blocklist
-- 请求超时限制
-- 文本长度和链接数量限制
+- 禁止 `localhost / 127.0.0.1 / 内网地址`
+- 支持 allowlist / blocklist
+- 支持 timeout / max text length / max redirects / screenshot size 限制
 
 ### Human-in-the-loop
 
-需要确认的工具不会直接执行，而是：
+高风险操作执行前会：
 
-1. Runtime 发送 interrupt
+1. 中断 graph
 2. 前端显示确认卡片
-3. 用户允许/拒绝
-4. Graph resume
+3. 用户允许或拒绝
+4. 后端 resume graph
 
-## Checkpoint & Session
+## Persistence
 
-- 使用 `MemorySaver` 作为 LangGraph checkpointer
-- `sessionId` 同时作为 `thread_id`
-- 刷新页面后可以从 checkpoint 恢复对话
-- 当前是内存 checkpoint，进程重启后会丢失
+数据库层使用：
 
-## Audit Log
+- `Prisma + SQLite`
 
-工具审计日志输出到：
+当前模型包括：
 
-` .demo-output/audit/tool-activity.log `
+- `User`
+- `Session`
+- `Message`
+- `ToolCall`
+- `Checkpoint`
+- `AuditLog`
+- `AgentTrace`
+- `AgentRun`
+- `AgentStep`
+- `ModelCall`
+- `InterruptEvent`
+- `ErrorLog`
+- `ProjectMemory`
 
-日志内容包括：
+对应 schema：
 
-- `toolName`
-- `toolCallId`
-- `source`
-- `riskLevel`
-- `permissions`
-- `args`
-- `outcome`
-- `detail`
+- [prisma/schema.prisma](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/prisma/schema.prisma)
+
+## Conversation Memory
+
+聊天级长期记忆已经接入：
+
+- `Session.summary`
+- `Message.archived`
+- 超过阈值后自动总结旧消息
+- 上下文只加载 `summary + recent messages`
+
+相关文件：
+
+- [src/lib/chat/summary-store.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/chat/summary-store.ts)
+- [src/lib/chat/summarizer.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/chat/summarizer.ts)
+- [src/lib/chat/context.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/chat/context.ts)
+
+目标：
+
+- 长对话不再无限增长
+- 降低 token 消耗
+- 降低内存占用
+
+## Project Memory / RAG
+
+项目级长期记忆已经接入：
+
+- 项目结构记忆
+- 技术栈记忆
+- 架构决策记忆
+- bug 修复记忆
+- patch / 项目知识索引
+
+相关目录：
+
+- [src/lib/project-memory](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/project-memory)
+
+当前支持：
+
+- 文件扫描与 chunking
+- `local / openai / gemini` embedding provider
+- SQLite 存储
+- cosine similarity 检索
+- patch 后 memory refresh
+
+Gemini 代理也已经支持，例如：
+
+```bash
+GEMINI_PROXY_URL=http://127.0.0.1:7890
+```
+
+## Code Agent Workflow
+
+项目已经支持代码执行型 Agent 的完整主线：
+
+1. 项目索引
+2. 代码搜索
+3. 文件读取与 compact context
+4. patch proposal
+5. 前端 diff preview
+6. 用户审批写入
+7. lint / typecheck / tests
+8. git / GitHub 联动
+
+相关目录：
+
+- [src/lib/code-agent](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/code-agent)
+- [src/lib/tools/code-agent.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/tools/code-agent.ts)
+
+## Observability / Trace
+
+这版已经不是黑盒了。
+
+当前已接入：
+
+- `runId`
+- `AgentRun`
+- `AgentStep`
+- `ModelCall`
+- `ToolCall`
+- `InterruptEvent`
+- `ErrorLog`
+
+后端查询：
+
+- `GET /api/chat?sessionId=...&includeRuns=true`
+- `GET /api/chat?runId=...&includeTrace=true`
+
+前端现状：
+
+- 右侧只显示“当前运行中的 Agent”
+- 显示当前 runId、run 状态、active agent 和实时状态文本
+
+说明：
+
+- Trace 明细接口已经可用
+- 前端现在刻意做成轻量版，不再把全部 trace 细节都塞进侧栏
+
+## Project Structure
+
+```text
+src/
+  app/api/chat/route.ts            # 聊天 API、runtime 选择、resume、trace 查询
+  components/chat/                 # 聊天 UI、工具卡片、当前 agent 面板
+  lib/
+    agent/                         # 手写 runtime、langgraph runtime、节点逻辑
+    multi-agent/                   # planner/executor/reviewer/finalizer 多 Agent runtime
+    graph/                         # LangGraph 单 Agent 状态图
+    tools/                         # Tool Registry、本地工具、风险/权限策略
+    mcp/                           # filesystem/github/browser MCP client + server
+    code-agent/                    # patch、git、project checks、代码工作流
+    chat/                          # session store、summary memory、context 组装
+    project-memory/                # 项目级 RAG / embedding / retrieval
+    observability/                 # run/step/model/tool/interrupt/error 查询与落库
+    audit/                         # 文件级工具审计日志
+  types/chat.ts                    # 前后端共享流事件定义
+prisma/
+  schema.prisma                    # Prisma schema
+```
 
 ## Environment Variables
 
-建议在 `.env.local` 中配置：
+建议配置在 `.env.local`：
 
 ```bash
-OPENAI_API_KEY=...
+DATABASE_URL=file:/绝对路径到/prisma/dev.db
 DEEPSEEK_API_KEY=...
+OPENAI_API_KEY=...
+GEMINI_API_KEY=...
 GITHUB_TOKEN=...
 ```
 
-Browser MCP 可选配置：
+Browser 相关：
 
 ```bash
 BROWSER_EXECUTABLE_PATH=/Applications/Google Chrome.app/Contents/MacOS/Google Chrome
@@ -244,11 +426,17 @@ BROWSER_DOMAIN_ALLOWLIST=
 BROWSER_DOMAIN_BLOCKLIST=localhost,127.0.0.1,0.0.0.0,::1,.local
 ```
 
-GitHub MCP 可选配置：
+GitHub 相关：
 
 ```bash
 GITHUB_DEFAULT_REPO=owner/repo
 GITHUB_API_BASE_URL=https://api.github.com
+```
+
+Gemini 代理示例：
+
+```bash
+GEMINI_PROXY_URL=http://127.0.0.1:7890
 ```
 
 ## Getting Started
@@ -257,6 +445,18 @@ GITHUB_API_BASE_URL=https://api.github.com
 
 ```bash
 pnpm install
+```
+
+生成 Prisma Client：
+
+```bash
+pnpm db:generate
+```
+
+执行数据库迁移：
+
+```bash
+pnpm db:migrate
 ```
 
 启动开发环境：
@@ -269,35 +469,37 @@ pnpm dev
 
 [http://localhost:3000](http://localhost:3000)
 
-## Browser Support Notes
-
-Browser MCP 当前优先使用：
-
-- `Playwright + 本机 Google Chrome`
-
-这是为了避免首次安装时 Chromium 下载过慢的问题。  
-如果你想让 Playwright 使用自己的浏览器，也可以手动执行：
-
-```bash
-pnpm exec playwright install chromium
-```
-
 ## How To Verify
 
 ### 1. 基础聊天
 
-在页面中输入：
+输入：
 
 ```text
-介绍一下你自己
+你好，我是 Alice，请介绍一下你自己
 ```
 
 预期：
 
-- 返回流式文本
-- 对话会写入 session
+- assistant 最终回答是流式输出
+- 右侧能看到当前运行 agent
+- 简单任务默认不会触发 plan 审批
 
-### 2. Filesystem MCP
+### 2. Weather / Tool Calling
+
+输入：
+
+```text
+帮我查一下南京天气
+```
+
+预期：
+
+- 触发工具调用
+- 最终回答是流式输出
+- 不会重复出现两份相同回复
+
+### 3. Filesystem MCP
 
 输入：
 
@@ -318,7 +520,7 @@ pnpm exec playwright install chromium
 - 前两条直接执行
 - 写文件前弹确认卡片
 
-### 3. GitHub MCP
+### 4. GitHub MCP
 
 输入：
 
@@ -337,9 +539,9 @@ pnpm exec playwright install chromium
 预期：
 
 - 前两条直接执行
-- create issue 前弹确认卡片
+- create issue 前确认
 
-### 4. Browser MCP
+### 5. Browser MCP
 
 输入：
 
@@ -357,60 +559,57 @@ pnpm exec playwright install chromium
 
 预期：
 
-- 分别调用 `browser_open_url`、`browser_get_text`、`browser_get_links`、`browser_screenshot`
+- 可调用 `browser_open_url / browser_get_text / browser_get_links / browser_screenshot`
 
-交互验证：
+### 6. Multi-Agent
 
-```text
-点击搜索框
-```
+输入：
 
 ```text
-输入 hello
-```
-
-```text
-提交表单
+帮我分析这个项目结构，并总结技术栈
 ```
 
 预期：
 
-- `click / type / submit` 先确认再执行
+- planner / executor / reviewer / finalizer 会依次工作
+- 右侧显示当前运行 agent
+- 最终回答在 finalizer 阶段流式生成
 
-## API Notes
+### 7. Code Agent
 
-聊天接口：
+输入：
 
-- `GET /api/chat?sessionId=...&useLangGraph=true`
-- `POST /api/chat`
+```text
+帮我找到 weather tool 在哪里
+```
 
-请求体支持：
+```text
+帮我修改 ToolCallCard 的 UI，但先给我 patch 预览
+```
 
-- `sessionId`
-- `messages`
-- `useLangGraph`
-- `confirmation`
+```text
+帮我运行 typecheck
+```
 
-当 `useLangGraph === true` 时，路由会走：
+预期：
 
-- `runLangGraphRuntime`
-- `resumeLangGraphRuntime`
-
-否则走旧的手写 Runtime。
+- 可定位文件
+- 可生成 patch proposal
+- 可运行检查命令
 
 ## Current Limitations
 
-- checkpoint 目前是内存版，不是持久化数据库
-- Browser MCP 目前使用单页面 session，不是多 tab / 多 profile
-- GitHub 写操作依赖有效的 `GITHUB_TOKEN`
-- Browser 工具当前使用 CSS selector 作为交互定位方式
+- LangGraph checkpoint 目前仍以 `MemorySaver` 为主，不是真正数据库级 checkpointer
+- Trace 明细前端目前是轻量展示，不是完整 timeline 面板
+- Model token / cost 目前优先记录估算值，不是 provider 精确账单值
+- Browser 交互当前仍以 CSS selector 为主，不是视觉定位 / DOM snapshot picker
+- 多 Agent 内部所有节点还不是全部 token 级流式，当前重点是最终回答和 executor 体验流式化
 
-## Next Steps
+## Future Directions
 
-后续比较自然的演进方向：
-
-- 将 checkpoint 持久化到 SQLite / Postgres / Redis
+- 把 checkpoint 真正切到数据库 saver
+- 为 Trace 做完整时间线面板和 replay UI
+- 接入更精确的 token / cost 统计
 - 为 Browser MCP 增加 DOM snapshot / element picker
-- 为 GitHub MCP 增加 PR / comment / commit 查询能力
-- 将 Browser 和 GitHub 的权限策略做成可配置规则
-- 增加自动化测试与回归验证脚本
+- 增加自动化回归测试
+- 继续提升多 Agent 的并行与路由质量

@@ -3,16 +3,34 @@ import {
   resumeLangGraphRuntime,
   runLangGraphRuntime,
 } from "../../../lib/agent/langgraphRuntime";
-import { getRuntimeThreadState } from "../../../lib/graph";
 import {
-  cloneSessionMessages,
+  resumeMultiAgentRuntime,
+  runMultiAgentRuntime,
+} from "../../../lib/multi-agent/runtime";
+import {
+  getPersistedRuntimeThreadState,
+  getRuntimeThreadState,
+} from "../../../lib/graph";
+import {
+  buildAgentContext,
+  deleteSession,
+  ensureSession,
+  getFullSessionMessages,
+  isEphemeralContextMessage,
+  listSessions,
+  maybeSummarizeSession,
   setSessionMessages,
   type SessionMessage,
-} from "../../../lib/chat/session-store";
+} from "../../../lib/chat";
 import {
   applyPatchProposal,
   rejectPatchProposal,
 } from "../../../lib/code-agent/proposals";
+import { createAgentRun } from "../../../lib/observability/store";
+import {
+  getRunTrace,
+  listSessionRuns,
+} from "../../../lib/observability/queries";
 
 type ClientMessage = {
   role: "user" | "assistant";
@@ -33,6 +51,12 @@ type PatchActionRequest = {
     content: string;
   }>;
 };
+
+function stripEphemeralSystemMessages(messages: SessionMessage[] | undefined) {
+  return (messages ?? []).filter(
+    (message) => !isEphemeralContextMessage(message)
+  );
+}
 
 function isClientMessage(value: unknown): value is ClientMessage {
   if (!value || typeof value !== "object") {
@@ -74,11 +98,22 @@ function toUiMessages(messages: SessionMessage[]) {
 }
 
 async function getCheckpointMessages(sessionId: string) {
-  const snapshot = await getRuntimeThreadState(sessionId);
-  const values =
-    snapshot.values && typeof snapshot.values === "object"
-      ? (snapshot.values as Record<string, unknown>)
-      : null;
+  let values: Record<string, unknown> | null = null;
+
+  try {
+    const snapshot = await getRuntimeThreadState(sessionId);
+    values =
+      snapshot.values && typeof snapshot.values === "object"
+        ? (snapshot.values as Record<string, unknown>)
+        : null;
+  } catch {
+    const persisted = await getPersistedRuntimeThreadState(sessionId);
+    values =
+      persisted && typeof persisted === "object"
+        ? (persisted as Record<string, unknown>)
+        : null;
+  }
+
   const messages = values?.messages;
 
   if (!Array.isArray(messages)) {
@@ -92,6 +127,49 @@ export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const sessionId = searchParams.get("sessionId");
   const useLangGraph = searchParams.get("useLangGraph") === "true";
+  const includeSessions = searchParams.get("includeSessions") === "true";
+  const includeRuns = searchParams.get("includeRuns") === "true";
+  const includeTrace = searchParams.get("includeTrace") === "true";
+  const runId = searchParams.get("runId");
+
+  if (includeSessions) {
+    const sessions = await listSessions();
+    return Response.json({
+      sessions,
+    });
+  }
+
+  if (includeRuns) {
+    if (!sessionId) {
+      return Response.json(
+        {
+          error: "Missing sessionId",
+        },
+        { status: 400 }
+      );
+    }
+
+    const runs = await listSessionRuns(sessionId);
+    return Response.json({
+      runs,
+    });
+  }
+
+  if (includeTrace) {
+    if (!runId) {
+      return Response.json(
+        {
+          error: "Missing runId",
+        },
+        { status: 400 }
+      );
+    }
+
+    const trace = await getRunTrace(runId);
+    return Response.json({
+      trace,
+    });
+  }
 
   if (!sessionId) {
     return Response.json(
@@ -102,7 +180,7 @@ export async function GET(req: Request) {
     );
   }
 
-  const storedMessages = toUiMessages(cloneSessionMessages(sessionId));
+  const storedMessages = toUiMessages(await getFullSessionMessages(sessionId));
   let messages = storedMessages;
 
   if (messages.length === 0 && useLangGraph) {
@@ -127,8 +205,10 @@ export async function POST(req: Request) {
   const sessionId = body.sessionId;
   const messages = body.messages;
   const useLangGraph = body.useLangGraph === true;
+  const useMultiAgent = body.useMultiAgent === true;
   const confirmation = body.confirmation;
   const patchAction = body.patchAction;
+  const deleteRequested = body.deleteSession === true;
 
   if (typeof sessionId !== "string" || sessionId.trim() === "") {
     return Response.json(
@@ -140,7 +220,32 @@ export async function POST(req: Request) {
     );
   }
 
-  if (useLangGraph && confirmation && typeof confirmation === "object") { // 如果请求中包含 confirmation 对象，说明这是一个工具执行的确认请求，调用 resumeLangGraphRuntime 来恢复运行，并传入用户的决策
+  if (deleteRequested) {
+    await deleteSession(sessionId);
+    return Response.json({
+      ok: true,
+      deleted: true,
+      sessionId,
+    });
+  }
+
+  const latestIncomingUserMessage = Array.isArray(messages)
+    ? [...messages]
+        .reverse()
+        .find((message) => isClientMessage(message) && message.role === "user")
+    : null;
+
+  if ((useLangGraph || useMultiAgent) && confirmation && typeof confirmation === "object") { // 如果请求中包含 confirmation 对象，说明这是一个工具执行的确认请求，调用对应 runtime 来恢复运行，并传入用户的决策
+    await ensureSession(sessionId);
+    const runId = crypto.randomUUID();
+    await createAgentRun({
+      runId,
+      sessionId,
+      runtimeType: useMultiAgent ? "multi_agent" : "langgraph",
+      trigger: "resume",
+      entrypoint: "/api/chat",
+      latestUserTask: latestIncomingUserMessage?.content ?? null,
+    });
     const decision = (confirmation as ConfirmationRequest).decision; // 从 confirmation 对象中提取用户的决策，应该是 "approved" 或 "rejected"
     const reason = (confirmation as ConfirmationRequest).reason; // 从 confirmation 对象中提取用户拒绝的原因（如果有的话）
 
@@ -155,23 +260,49 @@ export async function POST(req: Request) {
       );
     }
 
-    const stream = await resumeLangGraphRuntime( // 调用 resumeLangGraphRuntime 来恢复运行，并传入用户的决策
-      {
-        approved: decision === "approved",
-        reason:
-          typeof reason === "string" && reason.trim() !== ""
-            ? reason
-            : decision === "rejected"
-              ? "User rejected tool execution"
-              : undefined,
-      },
-      {
-        threadId: sessionId,// 传入线程 ID 以便在恢复运行时能够找到对应的线程状态
-        onFinish(nextMessages) {
-          setSessionMessages(sessionId, nextMessages); // 在运行完成后，调用 onFinish 回调函数，传入最新的消息列表，以便更新会话状态
-        },
-      }
-    );
+    const resumePayload = {
+      approved: decision === "approved",
+      reason:
+        typeof reason === "string" && reason.trim() !== ""
+          ? reason
+          : decision === "rejected"
+            ? "User rejected execution"
+            : undefined,
+    };
+
+    const stream = useMultiAgent
+        ? await resumeMultiAgentRuntime(
+          resumePayload,
+          {
+            threadId: sessionId,
+            runId,
+            onFinish(nextMessages) {
+              void (async () => {
+                await setSessionMessages(
+                  sessionId,
+                  stripEphemeralSystemMessages(nextMessages)
+                );
+                await maybeSummarizeSession(sessionId);
+              })();
+            },
+          }
+        )
+        : await resumeLangGraphRuntime(
+          resumePayload,
+          {
+            threadId: sessionId,// 传入线程 ID 以便在恢复运行时能够找到对应的线程状态
+            runId,
+            onFinish(nextMessages) {
+              void (async () => {
+                await setSessionMessages(
+                  sessionId,
+                  stripEphemeralSystemMessages(nextMessages)
+                );
+                await maybeSummarizeSession(sessionId);
+              })();
+            },
+          }
+        );
 
     return new Response(stream, {
       headers: {
@@ -248,9 +379,7 @@ export async function POST(req: Request) {
     );
   }
 
-  const latestUserMessage = [...messages]
-    .reverse()
-    .find((message) => isClientMessage(message) && message.role === "user");
+  const latestUserMessage = latestIncomingUserMessage;
 
   if (!latestUserMessage) {
     return Response.json(
@@ -262,25 +391,68 @@ export async function POST(req: Request) {
     );
   }
 
-  const sessionMessages = cloneSessionMessages(sessionId);
+  await ensureSession(sessionId);
+  const runId = crypto.randomUUID();
+  await createAgentRun({
+    runId,
+    sessionId,
+    runtimeType: useMultiAgent ? "multi_agent" : useLangGraph ? "langgraph" : "manual",
+    trigger: "request",
+    entrypoint: "/api/chat",
+    latestUserTask: latestUserMessage.content,
+  });
+
+  const sessionMessages = await buildAgentContext(
+    sessionId,
+    latestUserMessage.content
+  );
   sessionMessages.push({
     role: "user",
     content: latestUserMessage.content,
   });
 
-  const stream = useLangGraph
-    ? await runLangGraphRuntime(sessionMessages, {
+  const stream = useMultiAgent
+    ? await runMultiAgentRuntime(sessionMessages, {
         threadId: sessionId,
+        requirePlanApproval: true,
+        runId,
         onFinish(nextMessages) {
-          setSessionMessages(sessionId, nextMessages);
+          void (async () => {
+            await setSessionMessages(
+              sessionId,
+              stripEphemeralSystemMessages(nextMessages)
+            );
+            await maybeSummarizeSession(sessionId);
+          })();
         },
       })
-    : await runAgentRuntime(sessionMessages, {
-        sessionId,
-        onFinish(nextMessages) {
-          setSessionMessages(sessionId, nextMessages);
-        },
-      });
+    : useLangGraph
+      ? await runLangGraphRuntime(sessionMessages, {
+          threadId: sessionId,
+          runId,
+          onFinish(nextMessages) {
+            void (async () => {
+              await setSessionMessages(
+                sessionId,
+                stripEphemeralSystemMessages(nextMessages)
+              );
+              await maybeSummarizeSession(sessionId);
+            })();
+          },
+        })
+      : await runAgentRuntime(sessionMessages, {
+          sessionId,
+          runId,
+          onFinish(nextMessages) {
+            void (async () => {
+              await setSessionMessages(
+                sessionId,
+                stripEphemeralSystemMessages(nextMessages)
+              );
+              await maybeSummarizeSession(sessionId);
+            })();
+          },
+        });
 
   return new Response(stream, {
     headers: {

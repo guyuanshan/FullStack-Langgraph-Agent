@@ -3,6 +3,11 @@ import path from "node:path";
 import { appendToolAuditLog } from "../audit/log";
 import { createUnifiedDiff } from "./diff";
 import { validateWorkspacePath, WORKSPACE_ROOT } from "./workspace";
+import {
+  addProjectMemoryNote,
+  getProjectId,
+  refreshProjectMemory,
+} from "../project-memory";
 
 type PatchProposalFileInput = {
   path: string;
@@ -217,6 +222,35 @@ export async function applyPatchProposal(options: {
       backupDir,
       files: writtenFiles,
     }),
+  });
+
+  const appliedPaths = writtenFiles.map((file) => file.path);
+  await refreshProjectMemory({
+    paths: appliedPaths,
+    embeddingProvider: "local",
+  });
+  await addProjectMemoryNote({
+    projectId: getProjectId(),
+    type:
+      /bug|fix|修复/i.test(`${proposal.title} ${proposal.summary}`)
+        ? "bug_fix"
+        : "patch_memory",
+    chunkKey: `patch:${proposal.id}`,
+    title: proposal.title,
+    content: [
+      `Patch title: ${proposal.title}`,
+      proposal.summary ? `Summary: ${proposal.summary}` : null,
+      `Status: applied`,
+      `Files: ${appliedPaths.join(", ")}`,
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    metadata: {
+      proposalId: proposal.id,
+      files: appliedPaths,
+      status: "applied",
+    },
+    embeddingProvider: "local",
   });
 
   return {

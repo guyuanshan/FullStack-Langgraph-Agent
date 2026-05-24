@@ -258,6 +258,7 @@ export function ToolCallCard({
   const patchApplyResult = getPatchApplyResult(message.toolResult);
   const previewDataUrl = browserResult?.previewDataUrl ?? null;
   const linksCount = browserResult?.linksCount ?? null;
+  const progress = message.toolProgress;
 
   return (
     <div className="max-w-[85%] rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
@@ -302,6 +303,22 @@ export function ToolCallCard({
           <pre className="overflow-x-auto rounded-xl bg-slate-950/95 p-3 text-xs leading-5 text-slate-100">
             {formatJson(message.toolArgs)}
           </pre>
+        </div>
+      )}
+
+      {progress && (
+        <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
+          <p className="text-xs font-medium text-slate-500">
+            {progress.phase === "scanning"
+              ? "Scanning project"
+              : "Generating embeddings"}
+          </p>
+          <p className="mt-1 text-sm font-semibold text-slate-900">
+            {progress.completed} / {progress.total}
+          </p>
+          {progress.sourcePath ? (
+            <p className="mt-1 text-xs text-slate-500">{progress.sourcePath}</p>
+          ) : null}
         </div>
       )}
 

@@ -40,6 +40,8 @@ export interface ChatStream {
 }
 
 export interface ChatProvider {
+  providerName?: string;
+  modelName?: string;
   createChatStream(
     messages: ProviderMessage[],
     options?: CreateChatStreamOptions

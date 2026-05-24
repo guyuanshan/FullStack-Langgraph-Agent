@@ -13,6 +13,9 @@ const client = new OpenAI({
   baseURL: "https://api.deepseek.com",
 });
 
+export const DEEPSEEK_PROVIDER_NAME = "deepseek";
+export const DEEPSEEK_MODEL_NAME = "deepseek-v4-flash";
+
 type DeepSeekChunk = {
   choices?: Array<{
     delta?: {
@@ -42,12 +45,15 @@ function createEmptyToolCall(id?: string): ProviderToolCall {
 }
 
 class DeepSeekProvider implements ChatProvider {
+  providerName = DEEPSEEK_PROVIDER_NAME;
+  modelName = DEEPSEEK_MODEL_NAME;
+
   async createChatStream(
     messages: ProviderMessage[],
     options: CreateChatStreamOptions = {}
   ): Promise<ChatStream> {
     const response = await client.chat.completions.create({
-      model: "deepseek-v4-flash",
+      model: DEEPSEEK_MODEL_NAME,
       messages,
       tools:
         options.tools as unknown as OpenAI.Chat.ChatCompletionTool[] | undefined,

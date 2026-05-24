@@ -6,6 +6,8 @@ import {
   interrupt,
 } from "@langchain/langgraph";
 import { appendToolAuditLog } from "../audit/log";
+import { ensureSession } from "../chat";
+import { prisma } from "../db/client";
 import {
   appendToolError,
   callModelNode,
@@ -24,11 +26,21 @@ import {
 } from "../tools/policy";
 import { summarizeToolArgs } from "../tools/summary";
 import { AgentGraphState, type GraphAgentState } from "./state";
+import { updateToolCallOutcome } from "../tools/tool-call-store";
+import { upsertToolCallStart } from "../tools/tool-call-store";
+import {
+  appendErrorLog,
+  appendInterruptEvent,
+  completeAgentStep,
+  createAgentStep,
+} from "../observability/store";
 
 const memorySaver = new MemorySaver();
 
 function cloneAgentState(state: GraphAgentState): AgentState {
   return {
+    runId: state.runId,
+    activeStepId: state.activeStepId,
     sessionId: state.sessionId,
     messages: structuredClone(state.messages),
     step: state.step,
@@ -46,7 +58,58 @@ function cloneAgentState(state: GraphAgentState): AgentState {
 
 async function runModelDraft(state: GraphAgentState) { // 调用模型节点的函数，处理与模型交互的逻辑
   const nextState = cloneAgentState(state);
-  await callModelNode(nextState);
+  const stepId = nextState.runId
+    ? await createAgentStep({
+        runId: nextState.runId,
+        sessionId: nextState.sessionId,
+        agentName: "assistant",
+        nodeName: "callModelNode",
+        stepType: "model_node",
+        input: {
+          step: nextState.step,
+          messageCount: nextState.messages.length,
+        },
+      })
+    : null;
+
+  try {
+    nextState.activeStepId = stepId;
+    await callModelNode(nextState);
+    nextState.activeStepId = null;
+    if (stepId) {
+      await completeAgentStep({
+        stepId,
+        output: {
+          toolCallCount: nextState.toolCalls.length,
+          completionReason: nextState.completionReason,
+        },
+      });
+    }
+  } catch (error) {
+    nextState.activeStepId = null;
+    if (stepId) {
+      await completeAgentStep({
+        stepId,
+        status: "error",
+        output: {
+          completionReason: "error",
+        },
+      });
+    }
+    if (nextState.runId) {
+      await appendErrorLog({
+        runId: nextState.runId,
+        stepId,
+        sessionId: nextState.sessionId,
+        source: "callModelNode",
+        error,
+        context: {
+          step: nextState.step,
+        },
+      });
+    }
+    throw error;
+  }
   return {
     ...nextState,
     events: nextState.events,
@@ -56,40 +119,86 @@ async function runModelDraft(state: GraphAgentState) { // 调用模型节点的�
 async function runToolsDraft(state: GraphAgentState) { // 执行工具节点的函数，处理工具调用的逻辑
   const nextState = cloneAgentState(state); // 克隆当前状态以进行修改
   nextState.lastNode = "tools"; // 更新上一个节点为工具节点
+  const stepId = nextState.runId
+    ? await createAgentStep({
+        runId: nextState.runId,
+        sessionId: nextState.sessionId,
+        agentName: "assistant",
+        nodeName: "executeToolsNode",
+        stepType: "tool_node",
+        input: {
+          toolCalls: nextState.toolCalls.map((toolCall) => toolCall.function.name),
+        },
+      })
+    : null;
 
-  for (const toolCall of nextState.toolCalls) { // 遍历工具调用列表，逐个执行工具调用
-    if (hasToolMessage(nextState, toolCall.id)) { // 如果当前工具调用已经有对应的消息，说明它已经被处理过了，直接跳过继续下一个工具调用
-      continue;
-    }
+  try {
+    nextState.activeStepId = stepId;
+    for (const toolCall of nextState.toolCalls) { // 遍历工具调用列表，逐个执行工具调用
+      if (hasToolMessage(nextState, toolCall.id)) { // 如果当前工具调用已经有对应的消息，说明它已经被处理过了，直接跳过继续下一个工具调用
+        continue;
+      }
 
-    const toolName = toolCall.function.name; // 获取工具调用的工具名称
-    const args = parseToolCallArgs(toolCall);// 解析工具调用的参数
-    const tool = await getTool(toolName);
-    const riskLevel = resolveToolRiskLevel(tool, args); // 获取工具的风险级别，如果工具未定义则默认为安全
-    const permissions = resolveToolPermissions(tool);
+      const toolName = toolCall.function.name; // 获取工具调用的工具名称
+      const args = parseToolCallArgs(toolCall);// 解析工具调用的参数
+      const tool = await getTool(toolName);
+      const riskLevel = resolveToolRiskLevel(tool, args); // 获取工具的风险级别，如果工具未定义则默认为安全
+      const permissions = resolveToolPermissions(tool);
 
-    if (riskLevel !== "safe") { // 如果工具的风险级别需要确认，发送一个中断请求等待用户确认是否执行工具
-      const toolSummary = summarizeToolArgs(args);
-      const message =
-        riskLevel === "dangerous"
-          ? `危险操作：是否允许执行工具 ${toolName}？`
-          : `是否允许执行工具 ${toolName}？`;
+      if (riskLevel !== "safe") { // 如果工具的风险级别需要确认，发送一个中断请求等待用户确认是否执行工具
+        const toolSummary = summarizeToolArgs(args);
+        const message =
+          riskLevel === "dangerous"
+            ? `危险操作：是否允许执行工具 ${toolName}？`
+            : `是否允许执行工具 ${toolName}？`;
 
-      await appendToolAuditLog({
-        timestamp: new Date().toISOString(),
-        toolName,
-        toolCallId: toolCall.id,
-        source: tool?.source,
-        url: typeof args.url === "string" ? args.url : undefined,
-        riskLevel,
-        permissions,
-        args,
-        outcome: "interrupted",
-        resultSummary: toolSummary,
-        detail: message,
-      });
+        if (nextState.sessionId) {
+          await ensureSession(nextState.sessionId);
+        }
+        await upsertToolCallStart({
+          sessionId: nextState.sessionId,
+          runId: nextState.runId,
+          stepId: nextState.activeStepId,
+          toolCallId: toolCall.id ?? `${nextState.step}-${toolName}`,
+          toolName,
+          source: tool?.source,
+          riskLevel,
+          permissions,
+          args,
+        });
 
-      const decision = interrupt<
+        await appendToolAuditLog({
+          timestamp: new Date().toISOString(),
+          sessionId: nextState.sessionId ?? undefined,
+          toolName,
+          toolCallId: toolCall.id,
+          source: tool?.source,
+          url: typeof args.url === "string" ? args.url : undefined,
+          riskLevel,
+          permissions,
+          args,
+          outcome: "interrupted",
+          resultSummary: toolSummary,
+          detail: message,
+        });
+
+        if (nextState.runId) {
+          await appendInterruptEvent({
+            runId: nextState.runId,
+            stepId,
+            sessionId: nextState.sessionId,
+            kind: "tool_confirmation",
+            status: "pending",
+            message,
+            payload: {
+              toolName,
+              toolCallId: toolCall.id ?? `${nextState.step}-${toolName}`,
+              args,
+            },
+          });
+        }
+
+        const decision = interrupt<
         {
           kind: "tool_confirmation"; // 定义中断请求的类型，包含工具调用ID、工具名称、参数和提示消息等信息
           toolCallId: string;
@@ -101,43 +210,118 @@ async function runToolsDraft(state: GraphAgentState) { // 执行工具节点的�
           toolPermissions?: Array<"read" | "write" | "delete" | "execute">;
         },
         ToolConfirmationResume // 定义中断恢复时的类型，包含用户是否批准执行工具以及拒绝的原因等信息
-      >({
-        kind: "tool_confirmation", // 中断请求的类型
-        toolCallId: toolCall.id ?? `${nextState.step}-${toolName}`,
-        toolName,
-        args,
-        message,
-        toolSummary,
-        toolRiskLevel: riskLevel,
-        toolPermissions: permissions,
-      });
-
-      if (!decision?.approved) { // 如果用户拒绝执行工具，记录一个工具错误事件并继续下一个工具调用
-        await appendToolAuditLog({
-          timestamp: new Date().toISOString(),
+        >({
+          kind: "tool_confirmation", // 中断请求的类型
+          toolCallId: toolCall.id ?? `${nextState.step}-${toolName}`,
           toolName,
-          toolCallId: toolCall.id,
+          args,
+          message,
+          toolSummary,
+          toolRiskLevel: riskLevel,
+          toolPermissions: permissions,
+        });
+
+        if (nextState.runId) {
+          await appendInterruptEvent({
+            runId: nextState.runId,
+            stepId,
+            sessionId: nextState.sessionId,
+            kind: "tool_confirmation",
+            status: decision?.approved ? "approved" : "rejected",
+            message,
+            payload: {
+              toolName,
+              toolCallId: toolCall.id ?? `${nextState.step}-${toolName}`,
+            },
+            reason: decision?.reason,
+          });
+        }
+
+        if (!decision?.approved) { // 如果用户拒绝执行工具，记录一个工具错误事件并继续下一个工具调用
+          await appendToolAuditLog({
+            timestamp: new Date().toISOString(),
+            sessionId: nextState.sessionId ?? undefined,
+            toolName,
+            toolCallId: toolCall.id,
+            source: tool?.source,
+            url: typeof args.url === "string" ? args.url : undefined,
+            riskLevel,
+            permissions,
+            args,
+            outcome: "denied",
+            resultSummary: toolSummary,
+            detail:
+              decision?.reason ?? `User denied tool execution: ${toolName}`,
+          });
+          await updateToolCallOutcome({
+            sessionId: nextState.sessionId,
+            toolCallId: toolCall.id ?? `${nextState.step}-${toolName}`,
+            status: "denied",
+            resultSummary:
+              decision?.reason ?? `User denied tool execution: ${toolName}`,
+            errorMessage:
+              decision?.reason ?? `User denied tool execution: ${toolName}`,
+            approvedByUser: false,
+          });
+          appendToolError(
+            nextState,
+            toolCall,
+            toolName,
+            decision?.reason ?? `User denied tool execution: ${toolName}`
+          );
+          continue;
+        }
+
+        await upsertToolCallStart({
+          sessionId: nextState.sessionId,
+          runId: nextState.runId,
+          stepId: nextState.activeStepId,
+          toolCallId: toolCall.id ?? `${nextState.step}-${toolName}`,
+          toolName,
           source: tool?.source,
-          url: typeof args.url === "string" ? args.url : undefined,
           riskLevel,
           permissions,
           args,
-          outcome: "denied",
-          resultSummary: toolSummary,
-          detail:
-            decision?.reason ?? `User denied tool execution: ${toolName}`,
+          approvedByUser: true,
         });
-        appendToolError(
-          nextState,
-          toolCall,
-          toolName,
-          decision?.reason ?? `User denied tool execution: ${toolName}`
-        );
-        continue;
       }
-    }
 
-    await executeSingleToolCall(nextState, toolCall, args); // 执行工具调用，传入当前状态、工具调用对象和解析后的参数
+      await executeSingleToolCall(nextState, toolCall, args); // 执行工具调用，传入当前状态、工具调用对象和解析后的参数
+    }
+    if (stepId) {
+      await completeAgentStep({
+        stepId,
+        output: {
+          toolCallCount: nextState.toolCalls.length,
+          completionReason: nextState.completionReason,
+        },
+      });
+    }
+    nextState.activeStepId = null;
+  } catch (error) {
+    nextState.activeStepId = null;
+    if (stepId) {
+      await completeAgentStep({
+        stepId,
+        status: "error",
+        output: {
+          completionReason: "error",
+        },
+      });
+    }
+    if (nextState.runId) {
+      await appendErrorLog({
+        runId: nextState.runId,
+        stepId,
+        sessionId: nextState.sessionId,
+        source: "executeToolsNode",
+        error,
+        context: {
+          step: nextState.step,
+        },
+      });
+    }
+    throw error;
   }
 
   return {
@@ -198,4 +382,62 @@ export async function getRuntimeThreadState(threadId: string) {
       thread_id: threadId,
     },
   });
+}
+
+export async function persistRuntimeThreadState(threadId: string) {
+  const snapshot = await getRuntimeThreadState(threadId);
+  const values =
+    snapshot.values && typeof snapshot.values === "object"
+      ? snapshot.values
+      : null;
+
+  if (!values) {
+    return null;
+  }
+
+  await prisma.session.upsert({
+    where: {
+      id: threadId,
+    },
+    update: {},
+    create: {
+      id: threadId,
+    },
+  });
+
+  await prisma.checkpoint.upsert({
+    where: {
+      sessionId_threadId: {
+        sessionId: threadId,
+        threadId,
+      },
+    },
+    update: {
+      payload: JSON.stringify(values),
+    },
+    create: {
+      sessionId: threadId,
+      threadId,
+      payload: JSON.stringify(values),
+    },
+  });
+
+  return values;
+}
+
+export async function getPersistedRuntimeThreadState(threadId: string) {
+  const checkpoint = await prisma.checkpoint.findUnique({
+    where: {
+      sessionId_threadId: {
+        sessionId: threadId,
+        threadId,
+      },
+    },
+  });
+
+  if (!checkpoint) {
+    return null;
+  }
+
+  return JSON.parse(checkpoint.payload) as Record<string, unknown>;
 }

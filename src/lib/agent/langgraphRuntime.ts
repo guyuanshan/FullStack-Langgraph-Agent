@@ -4,6 +4,8 @@ import {
   isInterrupted,
 } from "@langchain/langgraph";
 import {
+  getPersistedRuntimeThreadState,
+  persistRuntimeThreadState,
   getRuntimeThreadState,
   runtimeStateGraph,
   type RuntimeGraphState,
@@ -16,6 +18,11 @@ import {
   type ToolConfirmationResume,
 } from "./confirmation";
 import { createAgentState } from "./state";
+import {
+  appendErrorLog,
+  appendInterruptEvent,
+  completeAgentRun,
+} from "../observability/store";
 
 type RuntimeMessage = ProviderMessage;
 type RuntimeResumeCommand = Command<
@@ -26,6 +33,7 @@ type RuntimeResumeCommand = Command<
 type RuntimeOptions = {
   onFinish?: (messages: RuntimeMessage[]) => void;
   threadId: string;
+  runId?: string;
 };
 
 const MAX_STEPS_ERROR_MESSAGE = "Agent Runtime Error";
@@ -55,7 +63,8 @@ function toRuntimeGraphState(
   const defaults = createAgentState(
     structuredClone(fallbackMessages),
     undefined,
-    threadId
+    threadId,
+    null
   );
 
   if (!values || typeof values !== "object") {
@@ -85,7 +94,18 @@ async function loadLatestThreadState(
     const snapshot = await getRuntimeThreadState(threadId);
     return toRuntimeGraphState(snapshot.values, fallbackMessages, threadId);
   } catch {
-    return createAgentState(structuredClone(fallbackMessages), undefined, threadId);
+    const persistedValues = await getPersistedRuntimeThreadState(threadId);
+
+    if (persistedValues) {
+      return toRuntimeGraphState(persistedValues, fallbackMessages, threadId);
+    }
+
+    return createAgentState(
+      structuredClone(fallbackMessages),
+      undefined,
+      threadId,
+      null
+    );
   }
 }
 
@@ -95,7 +115,12 @@ async function streamLangGraphInput(
 ) {
   const inputMessages = Array.isArray(input) ? input : [];
   const graphInput = Array.isArray(input)
-    ? createAgentState(structuredClone(input), undefined, options.threadId)
+    ? createAgentState(
+        structuredClone(input),
+        undefined,
+        options.threadId,
+        options.runId ?? null
+      )
     : input;
 
   return new ReadableStream({
@@ -103,10 +128,20 @@ async function streamLangGraphInput(
       let latestState: RuntimeGraphState = createAgentState(
         structuredClone(inputMessages),
         undefined,
-        options.threadId
+        options.threadId,
+        options.runId ?? null
       );
 
       try {
+        if (options.runId) {
+          controller.enqueue(
+            encodeSSE({
+              type: "run_started",
+              runId: options.runId,
+              runtimeType: "langgraph",
+            })
+          );
+        }
         const stream = await runtimeStateGraph.stream(graphInput, {
           streamMode: "values",
           configurable: {
@@ -119,6 +154,20 @@ async function streamLangGraphInput(
             const interruptPayload = chunk[INTERRUPT][0]?.value; // 获取中断的负载，假设只有一个中断请求
 
             if (isToolConfirmationInterrupt(interruptPayload)) { // 如果中断请求是一个工具确认的中断，发送一个事件到前端，询问用户是否允许执行工具
+              if (latestState.runId) {
+                await appendInterruptEvent({
+                  runId: latestState.runId,
+                  sessionId: latestState.sessionId,
+                  kind: "tool_confirmation",
+                  status: "pending",
+                  message: interruptPayload.message,
+                  payload: {
+                    toolName: interruptPayload.toolName,
+                    toolCallId: interruptPayload.toolCallId,
+                    args: interruptPayload.args,
+                  },
+                });
+              }
               controller.enqueue(
                 encodeSSE({
                   type: "confirm_request",
@@ -137,6 +186,22 @@ async function streamLangGraphInput(
               options.threadId,
               inputMessages
             );
+            await persistRuntimeThreadState(options.threadId);
+            if (latestState.runId) {
+              controller.enqueue(
+                encodeSSE({
+                  type: "run_finished",
+                  runId: latestState.runId,
+                  status: "interrupted",
+                  completionReason: "interrupted",
+                })
+              );
+              await completeAgentRun({
+                runId: latestState.runId,
+                status: "interrupted",
+                completionReason: "interrupted",
+              });
+            }
             options.onFinish?.(structuredClone(latestState.messages)); // 在用户做出决策后，调用 onFinish 回调函数，传入最新状态的消息列表
             controller.close();
             return;
@@ -151,6 +216,22 @@ async function streamLangGraphInput(
         }
 
         latestState = await loadLatestThreadState(options.threadId, inputMessages);
+        await persistRuntimeThreadState(options.threadId);
+        if (latestState.runId) {
+          controller.enqueue(
+            encodeSSE({
+              type: "run_finished",
+              runId: latestState.runId,
+              status: "completed",
+              completionReason: latestState.completionReason ?? "completed",
+            })
+          );
+          await completeAgentRun({
+            runId: latestState.runId,
+            status: "completed",
+            completionReason: latestState.completionReason ?? "completed",
+          });
+        }
 
         if (latestState.completionReason === "max_steps") {
           controller.enqueue(
@@ -165,6 +246,31 @@ async function streamLangGraphInput(
         controller.close();
       } catch (error) {
         console.error(error);
+        if (latestState.runId) {
+          controller.enqueue(
+            encodeSSE({
+              type: "run_finished",
+              runId: latestState.runId,
+              status: "error",
+              completionReason: "error",
+            })
+          );
+          await appendErrorLog({
+            runId: latestState.runId,
+            sessionId: latestState.sessionId,
+            source: "langgraph_runtime",
+            error,
+            context: {
+              threadId: options.threadId,
+            },
+          });
+          await completeAgentRun({
+            runId: latestState.runId,
+            status: "error",
+            completionReason: "error",
+            errorMessage: getErrorMessage(error),
+          });
+        }
         controller.enqueue(
           encodeSSE({
             type: "error",

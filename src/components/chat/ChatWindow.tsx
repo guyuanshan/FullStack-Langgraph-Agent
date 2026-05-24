@@ -5,9 +5,11 @@ import type { Dispatch, SetStateAction } from "react";
 import type { ChatMessage, StreamEvent } from "../../types/chat";
 import { Message } from "../chat/Message";
 import { MessageInput } from "../chat/MessageInput";
+import { TracePanel } from "./TracePanel";
 
 const CHAT_SESSION_STORAGE_KEY = "fullstack-langgraph-agent:session-id";
 const USE_LANGGRAPH = true;
+const USE_MULTI_AGENT = true;
 
 type ApiMessage = {
     role: "user" | "assistant";
@@ -17,6 +19,20 @@ type ApiMessage = {
 type SessionResponse = {
     sessionId: string;
     messages: ApiMessage[];
+};
+
+type SessionListItem = {
+    id: string;
+    title: string | null;
+    summary: string | null;
+    messageCount: number;
+    lastMessageAt: string | null;
+    updatedAt: string;
+    createdAt: string;
+};
+
+type SessionListResponse = {
+    sessions: SessionListItem[];
 };
 
 type ConfirmationDecision = "approved" | "rejected";
@@ -152,10 +168,50 @@ export function ChatWindow() {
     ]);
     // 加载状态，防止重复发送消息
     const [isLoading, setIsLoading] = useState(false);
-    const [sessionId] = useState<string | null>(() => getOrCreateSessionId());
+    const [sessionId, setSessionId] = useState<string | null>(() => getOrCreateSessionId());
+    const [sessions, setSessions] = useState<SessionListItem[]>([]);
+    const [currentRunId, setCurrentRunId] = useState<string | null>(null);
+    const [currentRunStatus, setCurrentRunStatus] = useState<
+        "running" | "completed" | "interrupted" | "error" | null
+    >(null);
+    const [currentAgent, setCurrentAgent] = useState<{
+        agentName: "planner" | "code" | "browser" | "reviewer" | "tool_executor" | "finalizer";
+        phase: "started" | "completed" | "handoff" | "error";
+        message: string;
+        latencyMs?: number;
+        toolCount?: number;
+    } | null>(null);
     const [isSessionLoading, setIsSessionLoading] = useState(
         () => sessionId !== null
     );
+
+    useEffect(() => {
+        let isCancelled = false;
+
+        async function loadSessions() {
+            try {
+                const response = await fetch("/api/chat?includeSessions=true");
+
+                if (!response.ok) {
+                    throw new Error(`Failed to load sessions ${response.status}`);
+                }
+
+                const data = (await response.json()) as SessionListResponse;
+
+                if (!isCancelled) {
+                    setSessions(data.sessions);
+                }
+            } catch (error) {
+                console.error(error);
+            }
+        }
+
+        void loadSessions();
+
+        return () => {
+            isCancelled = true;
+        };
+    }, [sessionId, isLoading]);
 
     useEffect(() => {
         if (!sessionId) {
@@ -219,6 +275,18 @@ export function ChatWindow() {
             return;
         }
 
+        if (event.type === "run_started") {
+            setCurrentRunId(event.runId);
+            setCurrentRunStatus("running");
+            return;
+        }
+
+        if (event.type === "run_finished") {
+            setCurrentRunId(event.runId);
+            setCurrentRunStatus(event.status);
+            return;
+        }
+
         if (event.type === "tool_start") {
             setState((prev) => {
                 const existingIndex = prev.findIndex(
@@ -264,6 +332,33 @@ export function ChatWindow() {
                         : message
                 );
             });
+            return;
+        }
+
+        if (event.type === "agent_status") {
+            setCurrentAgent({
+                agentName: event.agentName,
+                phase: event.phase,
+                message: event.message,
+                latencyMs: event.latencyMs,
+                toolCount: event.toolCount,
+            });
+            return;
+        }
+
+        if (event.type === "agent_delta") {
+            setCurrentAgent((prev) =>
+                prev && prev.agentName === event.agentName
+                    ? {
+                        ...prev,
+                        message: prev.message + event.text,
+                    }
+                    : {
+                        agentName: event.agentName,
+                        phase: "started",
+                        message: event.text,
+                    }
+            );
             return;
         }
 
@@ -361,6 +456,21 @@ export function ChatWindow() {
             return;
         }
 
+        if (event.type === "tool_progress") {
+            setState((prev) =>
+                prev.map((message) =>
+                    message.role === "tool" &&
+                    message.toolCallId === event.toolCallId
+                        ? {
+                            ...message,
+                            toolProgress: event.progress,
+                        }
+                        : message
+                )
+            );
+            return;
+        }
+
         if (event.type === "tool_error") {
             setState((prev) => {
                 const toolIndex = [...prev].reverse().findIndex(
@@ -442,12 +552,18 @@ export function ChatWindow() {
                 {
                     sessionId,
                     useLangGraph: USE_LANGGRAPH,
+                    useMultiAgent: USE_MULTI_AGENT,
                     messages: nextMessages,
                 },
                 assistantMessage.id,
                 (event, nextAssistantMessageId) =>
                     applyStreamEvent(event, nextAssistantMessageId, setMessages)
             );
+            const sessionsResponse = await fetch("/api/chat?includeSessions=true");
+            if (sessionsResponse.ok) {
+                const data = (await sessionsResponse.json()) as SessionListResponse;
+                setSessions(data.sessions);
+            }
         } catch (error) {
             console.error(error);
             // 如果发生错误，更新助手消息的内容为错误提示
@@ -463,6 +579,56 @@ export function ChatWindow() {
             );
         } finally {
             setIsLoading(false);
+        }
+    }
+
+    function handleCreateSession() {
+        const nextSessionId = createSessionId();
+        window.localStorage.setItem(CHAT_SESSION_STORAGE_KEY, nextSessionId);
+        setSessionId(nextSessionId);
+        setMessages([createMessage("assistant", "你好，我是你的 AI Agent 助手。")]);
+        setIsSessionLoading(false);
+        setCurrentRunId(null);
+        setCurrentRunStatus(null);
+        setCurrentAgent(null);
+    }
+
+    function handleSwitchSession(nextSessionId: string) {
+        window.localStorage.setItem(CHAT_SESSION_STORAGE_KEY, nextSessionId);
+        setSessionId(nextSessionId);
+        setIsSessionLoading(true);
+        setCurrentRunId(null);
+        setCurrentRunStatus(null);
+        setCurrentAgent(null);
+    }
+
+    async function handleDeleteSession(targetSessionId: string) {
+        if (isLoading) {
+            return;
+        }
+
+        await fetch("/api/chat", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                sessionId: targetSessionId,
+                deleteSession: true,
+            }),
+        });
+
+        const remainingSessions = sessions.filter(
+            (session) => session.id !== targetSessionId
+        );
+        setSessions(remainingSessions);
+
+        if (sessionId === targetSessionId) {
+            if (remainingSessions[0]?.id) {
+                handleSwitchSession(remainingSessions[0].id);
+            } else {
+                handleCreateSession();
+            }
         }
     }
 
@@ -500,6 +666,7 @@ export function ChatWindow() {
                 {
                     sessionId,
                     useLangGraph: USE_LANGGRAPH,
+                    useMultiAgent: USE_MULTI_AGENT,
                     confirmation: {
                         decision,
                     },
@@ -568,6 +735,7 @@ export function ChatWindow() {
                 body: JSON.stringify({
                     sessionId,
                     useLangGraph: USE_LANGGRAPH,
+                    useMultiAgent: USE_MULTI_AGENT,
                     patchAction: {
                         action,
                         proposalId,
@@ -614,33 +782,105 @@ export function ChatWindow() {
     }
     // 渲染聊天窗口，展示消息列表和消息输入组件
     return (
-        <main className="mx-auto flex h-screen max-w-3xl flex-col">
-            <header className="border-b px-4 py-3">
-                <h1 className="text-lg font-semibold">Fullstack LangGraph Agent</h1>
-            </header>
+        <main className="mx-auto flex h-screen max-w-[1600px]">
+            <aside className="hidden w-80 shrink-0 border-r bg-slate-50 md:flex md:flex-col">
+                <div className="flex items-center justify-between border-b px-4 py-3">
+                    <h2 className="text-sm font-semibold text-slate-900">Sessions</h2>
+                    <button
+                        type="button"
+                        onClick={handleCreateSession}
+                        className="rounded-lg bg-black px-3 py-2 text-xs text-white"
+                    >
+                        新建会话
+                    </button>
+                </div>
+                <div className="flex-1 overflow-y-auto p-3">
+                    <div className="space-y-2">
+                        {sessions.map((session) => (
+                            <div
+                                key={session.id}
+                                className={`rounded-xl border p-3 ${
+                                    session.id === sessionId
+                                        ? "border-slate-900 bg-white"
+                                        : "border-slate-200 bg-white/70"
+                                }`}
+                            >
+                                <div className="flex items-start justify-between gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={() => handleSwitchSession(session.id)}
+                                        className="text-left"
+                                    >
+                                        <p className="text-sm font-semibold text-slate-900">
+                                            {session.title ?? "Untitled session"}
+                                        </p>
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => void handleDeleteSession(session.id)}
+                                        className="text-xs text-slate-500"
+                                    >
+                                        删除
+                                    </button>
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={() => handleSwitchSession(session.id)}
+                                    className="mt-1 block w-full text-left"
+                                >
+                                    <p className="line-clamp-3 text-xs text-slate-600">
+                                        {session.summary ?? `${session.messageCount} messages`}
+                                    </p>
+                                </button>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            </aside>
 
-            <section className="flex-1 space-y-4 overflow-y-auto p-4">
-                {messages.map((message) => (
-                    <Message
-                        key={message.id}
-                        message={message}
-                        onConfirmTool={(toolMessage) =>
-                            void handleToolConfirmation(toolMessage, "approved")
-                        }
-                        onRejectTool={(toolMessage) =>
-                            void handleToolConfirmation(toolMessage, "rejected")
-                        }
-                        onApprovePatch={(toolMessage, files) =>
-                            void handlePatchProposalAction(toolMessage, "apply", files)
-                        }
-                        onRejectPatch={(toolMessage) =>
-                            void handlePatchProposalAction(toolMessage, "reject")
-                        }
-                    />
-                ))}
-            </section>
+            <div className="flex min-w-0 flex-1 flex-col">
+                <header className="border-b px-4 py-3">
+                    <div className="flex items-center justify-between gap-3">
+                        <h1 className="text-lg font-semibold">Fullstack LangGraph Agent</h1>
+                        <button
+                            type="button"
+                            onClick={handleCreateSession}
+                            className="rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-700 md:hidden"
+                        >
+                            新建会话
+                        </button>
+                    </div>
+                </header>
 
-            <MessageInput onSendMessage={handleSendMessage} />
+                <section className="flex-1 space-y-4 overflow-y-auto p-4">
+                    {messages.map((message) => (
+                        <Message
+                            key={message.id}
+                            message={message}
+                            onConfirmTool={(toolMessage) =>
+                                void handleToolConfirmation(toolMessage, "approved")
+                            }
+                            onRejectTool={(toolMessage) =>
+                                void handleToolConfirmation(toolMessage, "rejected")
+                            }
+                            onApprovePatch={(toolMessage, files) =>
+                                void handlePatchProposalAction(toolMessage, "apply", files)
+                            }
+                            onRejectPatch={(toolMessage) =>
+                                void handlePatchProposalAction(toolMessage, "reject")
+                            }
+                        />
+                    ))}
+                </section>
+
+                <MessageInput onSendMessage={handleSendMessage} />
+            </div>
+
+            <TracePanel
+                currentRunId={currentRunId}
+                currentRunStatus={currentRunStatus}
+                currentAgent={currentAgent}
+            />
         </main>
     );
 }

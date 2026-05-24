@@ -16,6 +16,8 @@ function replaceValue<Value>(defaultValue: () => Value) { // 创建一个替换�
 }
 
 export const AgentGraphState = Annotation.Root({ // 定义一个AgentGraphState的根注解，包含了代理状态的各种属性
+  runId: replaceValue<string | null>(() => null),
+  activeStepId: replaceValue<string | null>(() => null),
   sessionId: replaceValue<string | null>(() => null),
   messages: replaceValue<ProviderMessage[]>(() => []),
   step: replaceValue<number>(() => 0),
