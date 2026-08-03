@@ -1,5 +1,6 @@
 export type ToolConfirmationInterrupt = {
   kind: "tool_confirmation";
+  approvalId?: string;
   toolCallId: string;
   toolName: string;
   args: Record<string, unknown>;

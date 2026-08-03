@@ -1,11 +1,15 @@
-import { readFile, readdir, stat } from "node:fs/promises";
+import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 import {
+  getDefaultSandboxContext,
   isBlockedPathSegment,
   isTextLikeFile,
-  validateWorkspacePath,
   WORKSPACE_ROOT,
 } from "../code-agent/workspace";
+import {
+  readText,
+  validateWorkspacePath,
+} from "../file-sandbox";
 import { buildProjectSummary } from "../code-agent/project";
 import { getProjectId, getProjectLabel } from "./project";
 import type { MemoryChunk, ProjectMemoryType } from "./types";
@@ -109,7 +113,10 @@ async function collectIndexableFiles(
     }
 
     try {
-      validateWorkspacePath(nextRelativePath);
+      validateWorkspacePath(getDefaultSandboxContext("read"), nextRelativePath, {
+        allowRoot: false,
+        access: "read",
+      });
     } catch {
       continue;
     }
@@ -130,9 +137,10 @@ async function collectIndexableFiles(
 }
 
 async function createFileChunks(projectId: string, relativePath: string) {
-  const { absolutePath, relativePath: safePath } = validateWorkspacePath(relativePath);
-  const content = await readFile(absolutePath, "utf8");
-  const chunks = splitTextIntoChunks(content);
+  const context = getDefaultSandboxContext("read");
+  const result = await readText(context, relativePath);
+  const safePath = result.path;
+  const chunks = splitTextIntoChunks(result.content);
   const type = detectMemoryType(safePath);
 
   return chunks.map(

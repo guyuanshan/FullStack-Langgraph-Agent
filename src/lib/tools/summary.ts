@@ -40,6 +40,26 @@ export function summarizeToolArgs(args: Record<string, unknown>) {//
     return args.directory;
   }
 
+  if (
+    typeof args.remote === "string" ||
+    typeof args.repository === "string"
+  ) {
+    const repository =
+      typeof args.repository === "string"
+        ? args.repository
+        : "<unavailable>";
+    const remote =
+      typeof args.remote === "string" && args.remote.trim()
+        ? args.remote
+        : "origin";
+    const branch =
+      typeof args.branchName === "string" && args.branchName.trim()
+        ? args.branchName
+        : "<current>";
+
+    return `repository=${repository} · remote=${remote} · branch=${branch}`;
+  }
+
   if (typeof args.branchName === "string") {
     return args.branchName;
   }

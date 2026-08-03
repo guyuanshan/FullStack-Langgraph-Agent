@@ -38,6 +38,7 @@ export type StreamEvent = // 流事件类型定义
     }
   | {
       type: "confirm_request";
+      approvalId: string;
       toolName: string;
       toolCallId: string;
       args: Record<string, unknown>;
@@ -102,6 +103,7 @@ export interface ChatMessage { // 聊天消息接口定义
   toolResult?: unknown;
   toolError?: string;
   confirmMessage?: string;
+  approvalId?: string;
   toolSummary?: string;
   toolRiskLevel?: ToolRiskLevel;
   toolPermissions?: ToolPermission[];

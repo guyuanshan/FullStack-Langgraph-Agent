@@ -1,3 +1,4 @@
+import { resolveWriteTenantId } from "../db/tenant";
 import { createEmbedding, cosineSimilarity, resolveEmbeddingProvider } from "./embedding";
 import { getProjectId } from "./project";
 import { listProjectMemories } from "./store";
@@ -64,10 +65,22 @@ export async function retrieveProjectMemories(options: {
   query: string;
   topK?: number;
   projectId?: string;
+  tenantId?: string;
+  sessionId?: string | null;
   types?: ProjectMemoryType[];
   embeddingProvider?: string;
 }) {
   const query = options.query.trim();
+  if (!options.tenantId && !options.sessionId) {
+    throw new Error(
+      "tenantId or sessionId is required to retrieve project memories"
+    );
+  }
+
+  const tenantId = await resolveWriteTenantId({
+    tenantId: options.tenantId,
+    sessionId: options.sessionId,
+  });
 
   if (!query) {
     return {
@@ -81,7 +94,9 @@ export async function retrieveProjectMemories(options: {
   const projectId = options.projectId ?? getProjectId();
   const provider = resolveEmbeddingProvider(options.embeddingProvider);
   const queryEmbedding = await createEmbedding(query, provider);
-  const rows = await listProjectMemories(projectId);
+  const rows = await listProjectMemories(projectId, {
+    tenantId,
+  });
   const filteredRows = options.types?.length
     ? rows.filter((row) => options.types?.includes(row.type as ProjectMemoryType))
     : rows;

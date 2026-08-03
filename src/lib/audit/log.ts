@@ -1,18 +1,20 @@
 import { appendFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { prisma } from "../db/client";
+import { DEFAULT_TENANT_ID, resolveWriteTenantId } from "../db/tenant";
 import type {
   ToolArgs,
   ToolPermission,
   ToolRiskLevel,
 } from "../tools/types";
 
-export type ToolAuditEntry = { // 这里的设计是为了记录工具调用的详细信息，包括调用时间、工具名称、调用来源、风险等级、权限要求、参数和调用结果等。这些信息可以帮助我们审计工具的使用情况，分析潜在的安全风险，并提供必要的追踪和调试信息。
-  timestamp: string; // timestamp 字段记录了工具调用的时间
+export type ToolAuditEntry = {
+  timestamp: string;
+  tenantId?: string;
   sessionId?: string;
-  toolName: string;// toolName 字段记录了被调用的工具的名称
-  toolCallId?: string;// toolCallId 字段是一个可选字段，用于唯一标识一次工具调用，方便后续的追踪和分析
-  source?: "local" | "mcp"; // source 字段是一个可选字段，用于记录工具调用的来源，可以是 "local"（本地调用）或者 "mcp"（通过 MCP 调用） 
+  toolName: string;
+  toolCallId?: string;
+  source?: "local" | "mcp";
   url?: string;
   riskLevel?: ToolRiskLevel;
   permissions?: ToolPermission[];
@@ -25,7 +27,7 @@ export type ToolAuditEntry = { // 这里的设计是为了记录工具调用的�
     | "denied";
   resultSummary?: string;
   latencyMs?: number;
-  detail?: string;// detail 字段是一个可选字段，用于记录工具调用的详细结果或错误信息，提供更多上下文以便后续分析和调试
+  detail?: string;
 };
 
 const AUDIT_DIR = path.join(process.cwd(), ".demo-output", "audit");
@@ -34,11 +36,35 @@ const AUDIT_LOG_PATH = path.join(AUDIT_DIR, "tool-activity.log");
 // appendToolAuditLog 函数是一个异步函数，用于将工具调用的审计日志条目追加到日志文件中。它首先确保审计目录存在（如果不存在则创建），然后将日志条目以 JSON 格式追加到日志文件中，每条日志占一行。这种设计允许我们持续记录工具的使用情况，并且可以方便地进行后续分析和审计。
 export async function appendToolAuditLog(entry: ToolAuditEntry) {
   await mkdir(AUDIT_DIR, { recursive: true });
+
+  let tenantId: string;
+
+  try {
+    tenantId = await resolveWriteTenantId({
+      tenantId: entry.tenantId,
+      sessionId: entry.sessionId,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+
+    if (message.startsWith("TENANT_MISMATCH")) {
+      throw error;
+    }
+
+    // Standalone code-agent audits may omit session context.
+    if (!entry.sessionId) {
+      tenantId = entry.tenantId ?? DEFAULT_TENANT_ID;
+    } else {
+      throw error;
+    }
+  }
+
   await Promise.all([
     appendFile(AUDIT_LOG_PATH, `${JSON.stringify(entry)}\n`, "utf8"),
     prisma.auditLog
       .create({
         data: {
+          tenantId,
           sessionId: entry.sessionId ?? null,
           toolCallId: entry.toolCallId ?? null,
           toolName: entry.toolName,

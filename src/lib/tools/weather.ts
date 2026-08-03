@@ -16,6 +16,7 @@ export const weatherTool: ToolDefinition = {
   name: "get_weather",
   description: "Get weather information for a city",
   source: "local",
+  riskLevel: "safe",
   permissions: ["read"],
   parameters: {
     type: "object",

@@ -5,10 +5,9 @@ import type { ProviderToolDefinition } from "../ai/providers/types";
 import type {
   ToolArgs,
   ToolDefinition,
-  ToolPermission,
   ToolParameters,
-  ToolRiskLevel,
 } from "../tools/types";
+import { getMcpToolSecurityMetadata } from "./tool-security";
 
 type McpToolDefinition = ToolDefinition & {
   executeViaMcp: true;
@@ -76,69 +75,6 @@ async function getMcpClient(serverConfig: McpServerConfig) {
 
   clientPromises.set(serverConfig.id, clientPromise);
   return clientPromise;
-}
-
-function toToolRiskLevel(name: string): ToolRiskLevel {
-  if (name.startsWith("fs_delete")) {
-    return "dangerous";
-  }
-
-  if (
-    name.startsWith("fs_write") ||
-    name.startsWith("browser_click") ||
-    name.startsWith("browser_type") ||
-    name.startsWith("browser_submit") ||
-    name.startsWith("browser_reset") ||
-    name.startsWith("browser_close") ||
-    name.startsWith("github_create") ||
-    name.startsWith("github_comment") ||
-    name.startsWith("github_pr")
-  ) {
-    return "confirm_required";
-  }
-
-  return "safe";
-}
-
-function toToolPermissions(name: string): ToolPermission[] {
-  if (
-    name.startsWith("fs_read") ||
-    name.startsWith("fs_search") ||
-    name.startsWith("fs_list") ||
-    name.startsWith("browser_open") ||
-    name.startsWith("browser_get") ||
-    name.startsWith("browser_screenshot") ||
-    name.startsWith("github_search") ||
-    name.startsWith("github_read") ||
-    name.startsWith("github_list")
-  ) {
-    return ["read"];
-  }
-
-  if (
-    name.startsWith("fs_write") ||
-    name.startsWith("github_create") ||
-    name.startsWith("github_comment") ||
-    name.startsWith("github_pr")
-  ) {
-    return ["write"];
-  }
-
-  if (
-    name.startsWith("browser_click") ||
-    name.startsWith("browser_type") ||
-    name.startsWith("browser_submit") ||
-    name.startsWith("browser_reset") ||
-    name.startsWith("browser_close")
-  ) {
-    return ["execute"];
-  }
-
-  if (name.startsWith("fs_delete")) {
-    return ["delete"];
-  }
-
-  return [];
 }
 
 function toProviderToolDefinition(tool: ToolDefinition): ProviderToolDefinition {
@@ -262,17 +198,23 @@ export async function getMcpTools(): Promise<McpToolDefinition[]> {
           const client = await clientPromise;
           const result = await client.listTools();
 
-          return result.tools.map((tool) => ({
-            name: tool.name,
-            description: tool.description ?? "",
-            parameters: toToolParameters(tool.inputSchema),
-            source: "mcp" as const,
-            riskLevel: toToolRiskLevel(tool.name),
-            permissions: toToolPermissions(tool.name),
-            executeViaMcp: true as const,
-            execute: async (args: ToolArgs) =>
-              callMcpTool(clientPromise, tool.name, args),
-          }));
+          return result.tools.map((tool) => {
+            const security = getMcpToolSecurityMetadata(tool.name);
+
+            return {
+              name: tool.name,
+              description: tool.description ?? "",
+              parameters: toToolParameters(tool.inputSchema),
+              source: "mcp" as const,
+              riskLevel: security?.riskLevel,
+              permissions: security
+                ? [...security.permissions]
+                : undefined,
+              executeViaMcp: true as const,
+              execute: async (args: ToolArgs) =>
+                callMcpTool(clientPromise, tool.name, args),
+            };
+          });
         })
       );
 

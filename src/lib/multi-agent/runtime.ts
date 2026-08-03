@@ -15,6 +15,10 @@ import type {
   ProviderToolDefinition,
 } from "../ai/providers/types";
 import { ensureSession } from "../chat";
+import {
+  requireSessionInTenant,
+  upsertTenantCheckpoint,
+} from "../db/tenant-access";
 import { encodeSSE } from "../stream/sse";
 import { getProviderTools } from "../tools";
 import {
@@ -23,7 +27,6 @@ import {
   parseToolCallArgs,
 } from "../agent/nodes";
 import type { StreamEvent } from "../../types/chat";
-import { prisma } from "../db/client";
 import {
   createSubtaskPrompt,
   createExecutorPrompt,
@@ -48,6 +51,7 @@ import {
   type RuntimeMultiAgentState,
 } from "./state";
 import { appendAgentTrace } from "./store";
+import { buildApprovalPayload } from "../api/pending-approvals";
 import {
   appendErrorLog,
   appendInterruptEvent,
@@ -65,6 +69,7 @@ import type {
   ReviewerOutput,
   SubtaskResult,
 } from "./types";
+import type { AuthContext } from "../auth/tenant-resolution";
 
 const multiAgentMemorySaver = new MemorySaver();
 const liveRunEventEmitters = new Map<
@@ -78,7 +83,11 @@ type MultiAgentResume = {
 };
 type MultiAgentResumeCommand = Command<
   MultiAgentResume,
-  Record<string, never>,
+  {
+    auth?: AuthContext | null;
+    tenantId?: string | null;
+    sessionId?: string | null;
+  },
   "planner" | "executor" | "reviewer" | "finalizer"
 >;
 
@@ -103,8 +112,10 @@ function emitLiveRunEvent(runId: string | null, event: StreamEvent) {
 
 function cloneState(state: RuntimeMultiAgentState): MultiAgentState {
   return {
+    auth: state.auth,
     runId: state.runId,
     activeStepId: state.activeStepId,
+    tenantId: state.tenantId,
     sessionId: state.sessionId,
     messages: structuredClone(state.messages),
     events: structuredClone(state.events ?? []),
@@ -125,6 +136,14 @@ function cloneState(state: RuntimeMultiAgentState): MultiAgentState {
     finalAnswer: state.finalAnswer,
     completionReason: state.completionReason,
   };
+}
+
+function requireStateTenantId(state: { tenantId: string | null }) {
+  if (!state.tenantId) {
+    throw new Error("tenantId is required on multi-agent state");
+  }
+
+  return state.tenantId;
 }
 
 function appendObservation(
@@ -187,6 +206,7 @@ async function withObservedNode<T>(
   const stepId = state.runId
     ? await createAgentStep({
         runId: state.runId,
+        tenantId: state.tenantId,
         sessionId: state.sessionId,
         agentName: options.agentName,
         nodeName: options.nodeName,
@@ -201,6 +221,9 @@ async function withObservedNode<T>(
     if (stepId) {
       await completeAgentStep({
         stepId,
+        tenantId: requireStateTenantId(state),
+        sessionId: state.sessionId,
+        runId: state.runId,
         output: options.output ? options.output(result) : null,
       });
     }
@@ -211,6 +234,9 @@ async function withObservedNode<T>(
     if (stepId) {
       await completeAgentStep({
         stepId,
+        tenantId: requireStateTenantId(state),
+        sessionId: state.sessionId,
+        runId: state.runId,
         status: "error",
         output: {
           nodeName: options.nodeName,
@@ -220,6 +246,7 @@ async function withObservedNode<T>(
     if (state.runId) {
       await appendErrorLog({
         runId: state.runId,
+        tenantId: state.tenantId,
         stepId,
         sessionId: state.sessionId,
         source: options.nodeName,
@@ -517,8 +544,10 @@ async function executeAgentTask(
 
       await executeSingleToolCall(
         {
+          auth: state.auth,
           runId: state.runId,
           activeStepId: state.activeStepId,
+          tenantId: state.tenantId,
           sessionId: state.sessionId,
           messages: executionMessages,
           step,
@@ -932,43 +961,41 @@ async function plannerNode(state: RuntimeMultiAgentState) {
       });
 
       if (nextState.requirePlanApproval && nextState.planApproved === null) {
-        if (nextState.runId) {
-          await appendInterruptEvent({
-            runId: nextState.runId,
-            sessionId: nextState.sessionId,
-            kind: "plan_confirmation",
-            status: "pending",
-            message: "是否批准这个执行计划？",
-            payload: {
-              planSummary: createPlanSummary(plan),
-            },
-          });
+        if (!nextState.runId || !nextState.sessionId) {
+          throw new Error(
+            "Cannot request plan confirmation without runId and sessionId."
+          );
         }
+
+        const planSummary = createPlanSummary(plan);
+        const pendingApproval = await appendInterruptEvent({
+          runId: nextState.runId,
+          tenantId: nextState.tenantId,
+          sessionId: nextState.sessionId,
+          kind: "plan_confirmation",
+          status: "pending",
+          message: "是否批准这个执行计划？",
+          payload: buildApprovalPayload({
+            toolCallId: `plan-${nextState.sessionId}`,
+            toolName: "planner_plan",
+            planSummary,
+            riskLevel: "confirm_required",
+            permissions: ["execute"],
+          }),
+        });
 
         const resume = interrupt<
           {
             kind: "plan_confirmation";
+            approvalId: string;
             planSummary: string;
           },
           MultiAgentResume
         >({
           kind: "plan_confirmation",
-          planSummary: createPlanSummary(plan),
+          approvalId: pendingApproval.id,
+          planSummary,
         });
-
-        if (nextState.runId) {
-          await appendInterruptEvent({
-            runId: nextState.runId,
-            sessionId: nextState.sessionId,
-            kind: "plan_confirmation",
-            status: resume?.approved ? "approved" : "rejected",
-            message: "是否批准这个执行计划？",
-            payload: {
-              planSummary: createPlanSummary(plan),
-            },
-            reason: resume?.reason,
-          });
-        }
 
         if (!resume?.approved) {
           nextState.planApproved = false;
@@ -1159,7 +1186,14 @@ function getSafeMessages(
   return Array.isArray(messages) ? messages : fallbackMessages;
 }
 
-async function persistMultiAgentThreadState(threadId: string) {
+async function persistMultiAgentThreadState(
+  threadId: string,
+  options: { tenantId: string }
+) {
+  if (!options.tenantId) {
+    throw new Error("tenantId is required to persist multi-agent thread state");
+  }
+
   const scopedThreadId = createMultiAgentThreadId(threadId);
   const snapshot = await multiAgentGraph.getState({
     configurable: {
@@ -1175,27 +1209,11 @@ async function persistMultiAgentThreadState(threadId: string) {
     return null;
   }
 
-  await prisma.session.upsert({
-    where: { id: threadId },
-    update: {},
-    create: { id: threadId },
-  });
-
-  await prisma.checkpoint.upsert({
-    where: {
-      sessionId_threadId: {
-        sessionId: threadId,
-        threadId: scopedThreadId,
-      },
-    },
-    update: {
-      payload: JSON.stringify(values),
-    },
-    create: {
-      sessionId: threadId,
-      threadId: scopedThreadId,
-      payload: JSON.stringify(values),
-    },
+  await upsertTenantCheckpoint({
+    tenantId: options.tenantId,
+    sessionId: threadId,
+    threadId: scopedThreadId,
+    payload: values,
   });
 
   return values;
@@ -1204,11 +1222,17 @@ async function persistMultiAgentThreadState(threadId: string) {
 async function streamMultiAgentInput(
   input: MultiAgentState | MultiAgentResumeCommand,
   options: {
+    auth: AuthContext;
     threadId: string;
+    tenantId: string;
     onFinish?: (messages: ProviderMessage[]) => void;
     runId?: string;
   }
 ) {
+  if (!options.tenantId) {
+    throw new Error("tenantId is required to run multi-agent runtime");
+  }
+
   const scopedThreadId = createMultiAgentThreadId(options.threadId);
   const initialMessages = "messages" in input ? input.messages : [];
 
@@ -1217,7 +1241,14 @@ async function streamMultiAgentInput(
       let latestState =
         "messages" in input
           ? input
-          : createMultiAgentState([], options.threadId, false, options.runId ?? null);
+          : createMultiAgentState(
+              [],
+              options.threadId,
+              false,
+              options.runId ?? null,
+              options.tenantId,
+              options.auth
+            );
 
       try {
         if (options.runId) {
@@ -1242,13 +1273,48 @@ async function streamMultiAgentInput(
         for await (const chunk of stream as AsyncIterable<RuntimeMultiAgentState>) {
           if (isInterrupted(chunk)) {
             const interruptPayload = chunk[INTERRUPT][0]?.value as
-              | { kind?: string; planSummary?: string }
+              | {
+                  kind?: string;
+                  planSummary?: string;
+                  approvalId?: string;
+                }
               | undefined;
 
             if (interruptPayload?.kind === "plan_confirmation") {
+              let approvalId =
+                typeof interruptPayload.approvalId === "string"
+                  ? interruptPayload.approvalId
+                  : undefined;
+
+              if (!approvalId && latestState.runId) {
+                const pendingApproval = await appendInterruptEvent({
+                  runId: latestState.runId,
+                  tenantId: options.tenantId,
+                  sessionId: options.threadId,
+                  kind: "plan_confirmation",
+                  status: "pending",
+                  message: "是否批准这个执行计划？",
+                  payload: buildApprovalPayload({
+                    toolCallId: `plan-${options.threadId}`,
+                    toolName: "planner_plan",
+                    planSummary: interruptPayload.planSummary ?? "",
+                    riskLevel: "confirm_required",
+                    permissions: ["execute"],
+                  }),
+                });
+                approvalId = pendingApproval.id;
+              }
+
+              if (!approvalId) {
+                throw new Error(
+                  "Plan confirmation is missing a server approvalId."
+                );
+              }
+
               controller.enqueue(
                 encodeSSE({
                   type: "confirm_request",
+                  approvalId,
                   toolName: "planner_plan",
                   toolCallId: `plan-${options.threadId}`,
                   args: {
@@ -1262,8 +1328,15 @@ async function streamMultiAgentInput(
               );
             }
 
-            latestState = cloneState(chunk);
-            await persistMultiAgentThreadState(options.threadId);
+            latestState = {
+              ...cloneState(chunk),
+              auth: options.auth,
+              tenantId: options.tenantId,
+              sessionId: options.threadId,
+            };
+            await persistMultiAgentThreadState(options.threadId, {
+              tenantId: options.tenantId,
+            });
             if (latestState.runId) {
               controller.enqueue(
                 encodeSSE({
@@ -1275,6 +1348,8 @@ async function streamMultiAgentInput(
               );
               await completeAgentRun({
                 runId: latestState.runId,
+                tenantId: options.tenantId,
+                sessionId: options.threadId,
                 status: "interrupted",
                 completionReason: "interrupted",
               });
@@ -1289,13 +1364,20 @@ async function streamMultiAgentInput(
             return;
           }
 
-          latestState = cloneState(chunk);
+          latestState = {
+            ...cloneState(chunk),
+            auth: options.auth,
+            tenantId: options.tenantId,
+            sessionId: options.threadId,
+          };
           if (chunk.events?.length) {
             enqueueEvents(controller, chunk.events);
           }
         }
 
-        await persistMultiAgentThreadState(options.threadId);
+        await persistMultiAgentThreadState(options.threadId, {
+          tenantId: options.tenantId,
+        });
         if (latestState.runId) {
           controller.enqueue(
             encodeSSE({
@@ -1307,6 +1389,8 @@ async function streamMultiAgentInput(
           );
           await completeAgentRun({
             runId: latestState.runId,
+            tenantId: options.tenantId,
+            sessionId: options.threadId,
             status: "completed",
             completionReason: latestState.completionReason ?? "completed",
           });
@@ -1337,6 +1421,7 @@ async function streamMultiAgentInput(
           );
           await appendErrorLog({
             runId: latestState.runId,
+            tenantId: options.tenantId,
             sessionId: latestState.sessionId,
             source: "multi_agent_runtime",
             error,
@@ -1346,6 +1431,8 @@ async function streamMultiAgentInput(
           });
           await completeAgentRun({
             runId: latestState.runId,
+            tenantId: options.tenantId,
+            sessionId: options.threadId,
             status: "error",
             completionReason: "error",
             errorMessage: error instanceof Error ? error.message : "Unknown error",
@@ -1370,25 +1457,36 @@ async function streamMultiAgentInput(
 export async function runMultiAgentRuntime(
   messages: ProviderMessage[],
   options: {
+    auth: AuthContext;
     threadId: string;
+    tenantId: string;
     requirePlanApproval?: boolean;
     onFinish?: (messages: ProviderMessage[]) => void;
     runId?: string;
   }
 ) {
-  if (options.threadId) {
-    await ensureSession(options.threadId);
+  if (!options.tenantId) {
+    throw new Error("tenantId is required to run multi-agent runtime");
   }
+
+  await requireSessionInTenant(options.tenantId, options.threadId);
+  await ensureSession(options.threadId, {
+    tenantId: options.tenantId,
+  });
 
   return streamMultiAgentInput(
     createMultiAgentState(
       structuredClone(messages),
       options.threadId,
       options.requirePlanApproval ?? false,
-      options.runId ?? null
+      options.runId ?? null,
+      options.tenantId,
+      options.auth
     ),
     {
+      auth: options.auth,
       threadId: options.threadId,
+      tenantId: options.tenantId,
       onFinish: options.onFinish,
       runId: options.runId,
     }
@@ -1398,10 +1496,28 @@ export async function runMultiAgentRuntime(
 export async function resumeMultiAgentRuntime(
   resume: MultiAgentResume,
   options: {
+    auth: AuthContext;
     threadId: string;
+    tenantId: string;
     onFinish?: (messages: ProviderMessage[]) => void;
     runId?: string;
   }
 ) {
-  return streamMultiAgentInput(new Command({ resume }), options);
+  if (!options.tenantId) {
+    throw new Error("tenantId is required to resume multi-agent runtime");
+  }
+
+  await requireSessionInTenant(options.tenantId, options.threadId);
+
+  return streamMultiAgentInput(
+    new Command({
+      resume,
+      update: {
+        auth: options.auth,
+        tenantId: options.tenantId,
+        sessionId: options.threadId,
+      },
+    }),
+    options
+  );
 }

@@ -155,8 +155,12 @@ export function summarizeConversationMemory(
   return blocks.join("\n\n").slice(-MAX_SUMMARY_LENGTH);
 }
 
-export async function maybeSummarizeSession(sessionId: string) {
+export async function maybeSummarizeSession(
+  sessionId: string,
+  options: { tenantId: string }
+) {
   const activeCount = await getMessageCount(sessionId, {
+    tenantId: options.tenantId,
     archived: false,
   });
 
@@ -170,6 +174,7 @@ export async function maybeSummarizeSession(sessionId: string) {
   }
 
   const oldMessages = await getOldMessagesForSummary(sessionId, {
+    tenantId: options.tenantId,
     preserveRecent: RECENT_MESSAGE_WINDOW,
   });
 
@@ -182,14 +187,24 @@ export async function maybeSummarizeSession(sessionId: string) {
     };
   }
 
-  const { summary: previousSummary } = await getSessionSummary(sessionId);
+  const { summary: previousSummary } = await getSessionSummary(sessionId, {
+    tenantId: options.tenantId,
+  });
   const nextSummary = summarizeConversationMemory(
     previousSummary,
     oldMessages.map((entry) => entry.message)
   );
 
-  await updateSessionSummary(sessionId, nextSummary);
-  const archivedCount = await archiveMessagesById(oldMessages.map((entry) => entry.id));
+  await updateSessionSummary(sessionId, nextSummary, {
+    tenantId: options.tenantId,
+  });
+  const archivedCount = await archiveMessagesById(
+    oldMessages.map((entry) => entry.id),
+    {
+      tenantId: options.tenantId,
+      sessionId,
+    }
+  );
 
   return {
     summarized: true,

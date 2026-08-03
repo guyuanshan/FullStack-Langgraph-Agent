@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { prisma } from "../db/client";
+import { resolveWriteTenantId } from "../db/tenant";
 import { createEmbedding } from "./embedding";
 import type {
   MemoryChunk,
@@ -20,6 +21,8 @@ function hashContent(content: string) {
 }
 
 type SyncProjectMemoryOptions = {
+  tenantId?: string;
+  sessionId?: string | null;
   embeddingProvider?: string;
   concurrency?: number;
   onProgress?: (event: {
@@ -30,6 +33,21 @@ type SyncProjectMemoryOptions = {
     sourcePath: string | null;
   }) => void;
 };
+
+async function resolveProjectMemoryTenantId(
+  options?: SyncProjectMemoryOptions
+) {
+  if (!options?.tenantId && !options?.sessionId) {
+    throw new Error(
+      "tenantId or sessionId is required for project memory writes"
+    );
+  }
+
+  return resolveWriteTenantId({
+    tenantId: options?.tenantId,
+    sessionId: options?.sessionId,
+  });
+}
 
 function resolveConcurrency(options?: SyncProjectMemoryOptions) {
   if (typeof options?.concurrency === "number" && options.concurrency > 0) {
@@ -71,9 +89,14 @@ async function runWithConcurrency<T>(
   await Promise.all(workers);
 }
 
-async function loadExistingProjectMemory(projectId: string, sourcePaths?: string[]) {
+async function loadExistingProjectMemory(
+  tenantId: string,
+  projectId: string,
+  sourcePaths?: string[]
+) {
   const rows = await prisma.projectMemory.findMany({
     where: {
+      tenantId,
       projectId,
       ...(sourcePaths?.length
         ? {
@@ -107,12 +130,14 @@ export async function upsertProjectMemoryChunk(
   chunk: MemoryChunk,
   options?: SyncProjectMemoryOptions
 ) {
+  const tenantId = await resolveProjectMemoryTenantId(options);
   const embedding = await createEmbedding(chunk.content, options?.embeddingProvider);
   const contentHash = hashContent(chunk.content);
 
   return prisma.projectMemory.upsert({
     where: {
-      projectId_chunkKey: {
+      tenantId_projectId_chunkKey: {
+        tenantId,
         projectId: chunk.projectId,
         chunkKey: chunk.chunkKey,
       },
@@ -127,6 +152,7 @@ export async function upsertProjectMemoryChunk(
       contentHash,
     },
     create: {
+      tenantId,
       projectId: chunk.projectId,
       type: chunk.type,
       sourcePath: chunk.sourcePath,
@@ -145,11 +171,14 @@ export async function replaceProjectMemory(
   chunks: MemoryChunk[],
   options?: SyncProjectMemoryOptions
 ) {
+  const tenantId = await resolveProjectMemoryTenantId(options);
+  const scopedOptions = { ...options, tenantId };
   const incomingChunkKeys = new Set(chunks.map((chunk) => chunk.chunkKey));
-  const existingMap = await loadExistingProjectMemory(projectId);
+  const existingMap = await loadExistingProjectMemory(tenantId, projectId);
 
   await prisma.projectMemory.deleteMany({
     where: {
+      tenantId,
       projectId,
       chunkKey: {
         notIn: [...incomingChunkKeys],
@@ -170,7 +199,7 @@ export async function replaceProjectMemory(
     nextChunks,
     resolveConcurrency(options),
     async ({ chunk }) => {
-      await upsertProjectMemoryChunk(chunk, options);
+      await upsertProjectMemoryChunk(chunk, scopedOptions);
       completedCount += 1;
       options?.onProgress?.({
         phase: "embedding",
@@ -196,11 +225,18 @@ export async function refreshProjectMemoryPaths(
   sourcePaths: string[],
   options?: SyncProjectMemoryOptions
 ) {
-  const existingMap = await loadExistingProjectMemory(projectId, sourcePaths);
+  const tenantId = await resolveProjectMemoryTenantId(options);
+  const scopedOptions = { ...options, tenantId };
+  const existingMap = await loadExistingProjectMemory(
+    tenantId,
+    projectId,
+    sourcePaths
+  );
   const incomingChunkKeys = new Set(chunks.map((chunk) => chunk.chunkKey));
 
   await prisma.projectMemory.deleteMany({
     where: {
+      tenantId,
       projectId,
       AND: [
         {
@@ -230,7 +266,7 @@ export async function refreshProjectMemoryPaths(
     nextChunks,
     resolveConcurrency(options),
     async ({ chunk }) => {
-      await upsertProjectMemoryChunk(chunk, options);
+      await upsertProjectMemoryChunk(chunk, scopedOptions);
       completedCount += 1;
       options?.onProgress?.({
         phase: "embedding",
@@ -253,6 +289,8 @@ export async function refreshProjectMemoryPaths(
 
 export async function addProjectMemoryNote(options: {
   projectId: string;
+  tenantId?: string;
+  sessionId?: string | null;
   type: ProjectMemoryType;
   chunkKey: string;
   title?: string;
@@ -272,14 +310,24 @@ export async function addProjectMemoryNote(options: {
       metadata: options.metadata,
     },
     {
+      tenantId: options.tenantId,
+      sessionId: options.sessionId,
       embeddingProvider: options.embeddingProvider,
     }
   );
 }
 
-export async function listProjectMemories(projectId: string) {
+export async function listProjectMemories(
+  projectId: string,
+  options: { tenantId: string }
+) {
+  if (!options.tenantId) {
+    throw new Error("tenantId is required to list project memories");
+  }
+
   const rows = await prisma.projectMemory.findMany({
     where: {
+      tenantId: options.tenantId,
       projectId,
     },
     orderBy: [

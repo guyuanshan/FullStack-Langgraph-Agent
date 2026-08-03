@@ -1,4 +1,5 @@
 import { prisma } from "../db/client";
+import { assertTenantConsistency, resolveWriteTenantId } from "../db/tenant";
 
 export type RuntimeType = "manual" | "langgraph" | "multi_agent";
 export type RunTrigger = "request" | "resume";
@@ -56,15 +57,27 @@ function summarizeValue(value: unknown, maxLength = 1200) {
 
 export async function createAgentRun(options: {
   runId: string;
+  tenantId?: string | null;
   sessionId?: string | null;
   runtimeType: RuntimeType;
   trigger: RunTrigger;
   entrypoint?: string;
   latestUserTask?: string | null;
 }) {
+  const tenantId = await resolveWriteTenantId({
+    tenantId: options.tenantId,
+    sessionId: options.sessionId,
+  });
+
+  await assertTenantConsistency({
+    tenantId,
+    sessionId: options.sessionId,
+  });
+
   await prisma.agentRun.create({
     data: {
       id: options.runId,
+      tenantId,
       sessionId: options.sessionId ?? null,
       runtimeType: options.runtimeType,
       trigger: options.trigger,
@@ -77,26 +90,45 @@ export async function createAgentRun(options: {
 
 export async function completeAgentRun(options: {
   runId: string;
+  tenantId: string;
+  sessionId?: string | null;
   status?: Exclude<RunStatus, "running">;
   completionReason?: string | null;
   errorMessage?: string | null;
 }) {
-  const existing = await prisma.agentRun.findUnique({
-    where: { id: options.runId },
-    select: { startedAt: true },
-  });
-  const finishedAt = new Date();
+  if (!options.tenantId.trim()) {
+    throw new Error("tenantId is required to complete an agent run");
+  }
 
-  await prisma.agentRun.update({
+  const existing = await prisma.agentRun.findFirst({
     where: {
       id: options.runId,
+      tenantId: options.tenantId,
+      ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+    },
+    select: { startedAt: true },
+  });
+
+  if (!existing) {
+    throw new Error(
+      `AgentRun ${options.runId} not found for tenant ${options.tenantId}`
+    );
+  }
+
+  const finishedAt = new Date();
+
+  await prisma.agentRun.updateMany({
+    where: {
+      id: options.runId,
+      tenantId: options.tenantId,
+      ...(options.sessionId ? { sessionId: options.sessionId } : {}),
     },
     data: {
       status: options.status ?? "completed",
       completionReason: options.completionReason ?? null,
       errorMessage: options.errorMessage ?? null,
       finishedAt,
-      latencyMs: existing?.startedAt
+      latencyMs: existing.startedAt
         ? finishedAt.getTime() - existing.startedAt.getTime()
         : null,
     },
@@ -105,6 +137,7 @@ export async function completeAgentRun(options: {
 
 export async function createAgentStep(options: {
   runId: string;
+  tenantId?: string | null;
   sessionId?: string | null;
   agentName?: string | null;
   nodeName: string;
@@ -112,8 +145,21 @@ export async function createAgentStep(options: {
   status?: StepStatus;
   input?: unknown;
 }) {
+  const tenantId = await resolveWriteTenantId({
+    tenantId: options.tenantId,
+    sessionId: options.sessionId,
+    runId: options.runId,
+  });
+
+  await assertTenantConsistency({
+    tenantId,
+    sessionId: options.sessionId,
+    runId: options.runId,
+  });
+
   const step = await prisma.agentStep.create({
     data: {
+      tenantId,
       runId: options.runId,
       sessionId: options.sessionId ?? null,
       agentName: options.agentName ?? null,
@@ -132,22 +178,46 @@ export async function createAgentStep(options: {
 
 export async function completeAgentStep(options: {
   stepId: string;
+  tenantId: string;
+  sessionId?: string | null;
+  runId?: string | null;
   status?: Exclude<StepStatus, "started">;
   output?: unknown;
 }) {
-  const existing = await prisma.agentStep.findUnique({
-    where: { id: options.stepId },
+  if (!options.tenantId.trim()) {
+    throw new Error("tenantId is required to complete an agent step");
+  }
+
+  const existing = await prisma.agentStep.findFirst({
+    where: {
+      id: options.stepId,
+      tenantId: options.tenantId,
+      ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+      ...(options.runId ? { runId: options.runId } : {}),
+    },
     select: { startedAt: true },
   });
+
+  if (!existing) {
+    throw new Error(
+      `AgentStep ${options.stepId} not found for tenant ${options.tenantId}`
+    );
+  }
+
   const finishedAt = new Date();
 
-  await prisma.agentStep.update({
-    where: { id: options.stepId },
+  await prisma.agentStep.updateMany({
+    where: {
+      id: options.stepId,
+      tenantId: options.tenantId,
+      ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+      ...(options.runId ? { runId: options.runId } : {}),
+    },
     data: {
       status: options.status ?? "completed",
       outputSummary: summarizeValue(options.output),
       finishedAt,
-      latencyMs: existing?.startedAt
+      latencyMs: existing.startedAt
         ? finishedAt.getTime() - existing.startedAt.getTime()
         : null,
     },
@@ -156,16 +226,25 @@ export async function completeAgentStep(options: {
 
 export async function appendInterruptEvent(options: {
   runId: string;
+  tenantId?: string | null;
   stepId?: string | null;
   sessionId?: string | null;
   kind: string;
-  status: "pending" | "approved" | "rejected";
+  status: "pending" | "approved" | "rejected" | "expired";
   message?: string | null;
   payload?: unknown;
   reason?: string | null;
 }) {
-  await prisma.interruptEvent.create({
+  const tenantId = await resolveWriteTenantId({
+    tenantId: options.tenantId,
+    sessionId: options.sessionId,
+    runId: options.runId,
+    stepId: options.stepId,
+  });
+
+  return prisma.interruptEvent.create({
     data: {
+      tenantId,
       runId: options.runId,
       stepId: options.stepId ?? null,
       sessionId: options.sessionId ?? null,
@@ -175,11 +254,20 @@ export async function appendInterruptEvent(options: {
       payloadJson: summarizeValue(options.payload, 4000),
       reason: options.reason ?? null,
     },
+    select: {
+      id: true,
+      tenantId: true,
+      sessionId: true,
+      runId: true,
+      kind: true,
+      status: true,
+    },
   });
 }
 
 export async function appendErrorLog(options: {
   runId?: string | null;
+  tenantId?: string | null;
   stepId?: string | null;
   sessionId?: string | null;
   source: string;
@@ -194,9 +282,16 @@ export async function appendErrorLog(options: {
         : "Unknown error";
   const stack =
     options.error instanceof Error ? options.error.stack ?? null : null;
+  const tenantId = await resolveWriteTenantId({
+    tenantId: options.tenantId,
+    sessionId: options.sessionId,
+    runId: options.runId,
+    stepId: options.stepId,
+  });
 
   await prisma.errorLog.create({
     data: {
+      tenantId,
       runId: options.runId ?? null,
       stepId: options.stepId ?? null,
       sessionId: options.sessionId ?? null,
@@ -210,6 +305,7 @@ export async function appendErrorLog(options: {
 
 export async function appendModelCall(options: {
   runId: string;
+  tenantId?: string | null;
   stepId?: string | null;
   sessionId?: string | null;
   agentName?: string | null;
@@ -225,8 +321,16 @@ export async function appendModelCall(options: {
   output?: unknown;
   errorMessage?: string | null;
 }) {
+  const tenantId = await resolveWriteTenantId({
+    tenantId: options.tenantId,
+    sessionId: options.sessionId,
+    runId: options.runId,
+    stepId: options.stepId,
+  });
+
   await prisma.modelCall.create({
     data: {
+      tenantId,
       runId: options.runId,
       stepId: options.stepId ?? null,
       sessionId: options.sessionId ?? null,

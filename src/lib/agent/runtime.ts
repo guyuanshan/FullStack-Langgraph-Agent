@@ -16,11 +16,14 @@ import {
   completeAgentStep,
   createAgentStep,
 } from "../observability/store";
+import type { AuthContext } from "../auth/tenant-resolution";
 
 type RuntimeMessage = ProviderMessage;
 type RuntimeOptions = {
+  auth: AuthContext;
   onFinish?: (messages: RuntimeMessage[]) => void;
   sessionId?: string;
+  tenantId: string;
   runId?: string;
 };
 
@@ -61,6 +64,8 @@ function finishRuntime( // 结束运行的函数，处理运行结束的逻辑
   if (state.runId) {
     void completeAgentRun({
       runId: state.runId,
+      tenantId: options.tenantId,
+      sessionId: state.sessionId,
       status: "completed",
       completionReason: state.completionReason ?? "completed",
     });
@@ -82,6 +87,7 @@ async function advanceRuntime( // 推进运行的函数，根据当前状态执�
     const stepId = state.runId
       ? await createAgentStep({
           runId: state.runId,
+          tenantId: options.tenantId,
           sessionId: state.sessionId,
           agentName: "assistant",
           nodeName: "callModelNode",
@@ -98,6 +104,9 @@ async function advanceRuntime( // 推进运行的函数，根据当前状态执�
       if (stepId) {
         await completeAgentStep({
           stepId,
+          tenantId: options.tenantId,
+          sessionId: state.sessionId,
+          runId: state.runId,
           output: {
             toolCallCount: state.toolCalls.length,
           },
@@ -108,12 +117,16 @@ async function advanceRuntime( // 推进运行的函数，根据当前状态执�
       if (stepId) {
         await completeAgentStep({
           stepId,
+          tenantId: options.tenantId,
+          sessionId: state.sessionId,
+          runId: state.runId,
           status: "error",
         });
       }
       if (state.runId) {
         await appendErrorLog({
           runId: state.runId,
+          tenantId: options.tenantId,
           stepId,
           sessionId: state.sessionId,
           source: "manual_callModelNode",
@@ -130,6 +143,7 @@ async function advanceRuntime( // 推进运行的函数，根据当前状态执�
     const stepId = state.runId
       ? await createAgentStep({
           runId: state.runId,
+          tenantId: options.tenantId,
           sessionId: state.sessionId,
           agentName: "assistant",
           nodeName: "executeToolsNode",
@@ -146,6 +160,9 @@ async function advanceRuntime( // 推进运行的函数，根据当前状态执�
       if (stepId) {
         await completeAgentStep({
           stepId,
+          tenantId: options.tenantId,
+          sessionId: state.sessionId,
+          runId: state.runId,
           output: {
             toolCallCount: state.toolCalls.length,
           },
@@ -156,12 +173,16 @@ async function advanceRuntime( // 推进运行的函数，根据当前状态执�
       if (stepId) {
         await completeAgentStep({
           stepId,
+          tenantId: options.tenantId,
+          sessionId: state.sessionId,
+          runId: state.runId,
           status: "error",
         });
       }
       if (state.runId) {
         await appendErrorLog({
           runId: state.runId,
+          tenantId: options.tenantId,
           stepId,
           sessionId: state.sessionId,
           source: "manual_executeToolsNode",
@@ -188,13 +209,19 @@ async function advanceRuntime( // 推进运行的函数，根据当前状态执�
 
 export async function runAgentRuntime(
   messages: RuntimeMessage[],
-  options: RuntimeOptions = {}
+  options: RuntimeOptions
 ) {
+  if (!options.tenantId) {
+    throw new Error("tenantId is required to run agent runtime");
+  }
+
   const state = createAgentState(
     messages,
     undefined,
     options.sessionId ?? null,
-    options.runId ?? null
+    options.runId ?? null,
+    options.tenantId,
+    options.auth
   );
 
   return new ReadableStream({
@@ -233,12 +260,15 @@ export async function runAgentRuntime(
         if (state.runId) {
           await appendErrorLog({
             runId: state.runId,
+            tenantId: options.tenantId,
             sessionId: state.sessionId,
             source: "manual_runtime",
             error,
           });
           await completeAgentRun({
             runId: state.runId,
+            tenantId: options.tenantId,
+            sessionId: state.sessionId,
             status: "error",
             completionReason: "error",
             errorMessage: message,

@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { validateWorkspacePath, WORKSPACE_ROOT } from "./workspace";
+import { getDefaultSandboxContext, WORKSPACE_ROOT } from "./workspace";
+import { validateWorkspacePath } from "../file-sandbox";
 
 const execFileAsync = promisify(execFile);
 
@@ -121,8 +122,12 @@ export async function searchProjectCode(options: {
   const mode = options.mode ?? "auto";
   const maxResults = Math.min(Math.max(options.maxResults ?? 10, 1), 50);
   const query = options.query.trim();
+  const sandbox = getDefaultSandboxContext("read");
   const directory = options.directory
-    ? validateWorkspacePath(options.directory).relativePath
+    ? validateWorkspacePath(sandbox, options.directory, {
+        allowRoot: true,
+        access: "read",
+      }).relativePath
     : ".";
 
   if (!query) {

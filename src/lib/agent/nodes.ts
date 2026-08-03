@@ -4,20 +4,19 @@ import type {
   ProviderToolCallDelta,
 } from "../../lib/ai/providers/types";
 import { appendToolAuditLog } from "../../lib/audit/log";
-import { ensureSession } from "../../lib/chat";
 import {
   appendModelCall,
   estimateTokenCount,
 } from "../../lib/observability/store";
-import { executeTool, getProviderTools, getTool } from "../../lib/tools";
+import { getProviderTools } from "../../lib/tools";
+import {
+  authorizeAndExecuteTool,
+  evaluateToolAuthorization,
+} from "../../lib/tools/authorization";
 import {
   updateToolCallOutcome,
   upsertToolCallStart,
 } from "../../lib/tools/tool-call-store";
-import {
-  resolveToolPermissions,
-  resolveToolRiskLevel,
-} from "../../lib/tools/policy";
 import { encodeSSE } from "../../lib/stream/sse";
 import {
   getResultUrl,
@@ -184,27 +183,45 @@ export function appendToolError(
 export async function executeSingleToolCall(
   state: AgentState,
   toolCall: ProviderToolCall,
-  args = parseToolCallArgs(toolCall)
+  args = parseToolCallArgs(toolCall),
+  options: { approvalGranted?: boolean } = {}
 ) {
   const startedAt = Date.now();
   const name = toolCall.function.name;
-  const tool = await getTool(name);
-  const toolSummary = summarizeToolArgs(args);
-  const toolRiskLevel = resolveToolRiskLevel(tool, args);
-  const toolPermissions = resolveToolPermissions(tool);
+  if (!state.auth) {
+    throw new Error("AuthContext is required for tool execution");
+  }
+  if (!state.sessionId) {
+    throw new Error("sessionId is required for tool execution");
+  }
+
+  const authorization = await evaluateToolAuthorization({
+    auth: state.auth,
+    sessionId: state.sessionId,
+    toolName: name,
+    args,
+  });
+  const toolSummary =
+    authorization.summary ?? summarizeToolArgs(args);
+  const toolRiskLevel = authorization.decision.riskLevel;
+  const toolPermissions = authorization.permissions;
+  const toolSource = authorization.source;
   const progressEnabled =
     name === "project_memory_index" || name === "project_memory_refresh";
+  const needsAgentSessionId =
+    name === "code_propose_patch" ||
+    name === "project_memory_index" ||
+    name === "project_memory_refresh" ||
+    name === "project_memory_search";
   const executionArgs =
-    (name.startsWith("browser_") ||
-      name === "code_propose_patch" ||
-      progressEnabled) &&
+    (name.startsWith("browser_") || needsAgentSessionId || progressEnabled) &&
     state.sessionId
       ? {
           ...args,
           ...(name.startsWith("browser_")
             ? { browserSessionId: state.sessionId }
             : {}),
-          ...(name === "code_propose_patch"
+          ...(needsAgentSessionId
             ? { agentSessionId: state.sessionId }
             : {}),
           ...(progressEnabled
@@ -231,10 +248,6 @@ export async function executeSingleToolCall(
   console.log(`[agent step ${state.step}] tool name:`, name);
   console.log(`[agent step ${state.step}] tool args:`, args);
 
-  if (state.sessionId) {
-    await ensureSession(state.sessionId);
-  }
-
   state.events.push({
     type: "tool_start",
     toolName: name,
@@ -247,21 +260,24 @@ export async function executeSingleToolCall(
 
   await upsertToolCallStart({
     sessionId: state.sessionId,
+    tenantId: state.tenantId,
     runId: state.runId,
     stepId: state.activeStepId,
     toolCallId: toolCall.id ?? `${state.step}-${name}`,
     toolName: name,
-    source: tool?.source,
+    source: toolSource,
     riskLevel: toolRiskLevel,
     permissions: toolPermissions,
     args,
+    approvedByUser: options.approvalGranted ? true : undefined,
   });
   await appendToolAuditLog({
     timestamp: new Date().toISOString(),
+    tenantId: state.tenantId ?? undefined,
     sessionId: state.sessionId ?? undefined,
     toolName: name,
     toolCallId: toolCall.id,
-    source: tool?.source,
+    source: toolSource,
     url: typeof args.url === "string" ? args.url : undefined,
     riskLevel: toolRiskLevel,
     permissions: toolPermissions,
@@ -269,9 +285,19 @@ export async function executeSingleToolCall(
     outcome: "started",
   });
 
-  const execution = await executeTool(name, executionArgs);
+  const execution = await authorizeAndExecuteTool({
+    auth: state.auth,
+    sessionId: state.sessionId,
+    runId: state.runId,
+    stepId: state.activeStepId,
+    toolCallId: toolCall.id ?? `${state.step}-${name}`,
+    toolName: name,
+    args,
+    executionArgs,
+    approval: options.approvalGranted ? { approved: true } : undefined,
+  });
 
-  if (execution.ok) {
+  if (execution.status === "success") {
     console.log(`[agent step ${state.step}] tool result:`, execution.result);
     appendToolSuccess(state, toolCall, name, execution.result);
     const lastEvent = state.events[state.events.length - 1];
@@ -280,10 +306,11 @@ export async function executeSingleToolCall(
     }
     await appendToolAuditLog({
       timestamp: new Date().toISOString(),
+      tenantId: state.tenantId ?? undefined,
       sessionId: state.sessionId ?? undefined,
       toolName: name,
       toolCallId: toolCall.id,
-      source: tool?.source,
+      source: toolSource,
       url: getResultUrl(execution.result) ?? (typeof args.url === "string" ? args.url : undefined),
       riskLevel: toolRiskLevel,
       permissions: toolPermissions,
@@ -295,6 +322,7 @@ export async function executeSingleToolCall(
     });
     await updateToolCallOutcome({
       sessionId: state.sessionId,
+      tenantId: state.tenantId,
       toolCallId: toolCall.id ?? `${state.step}-${name}`,
       status: "success",
       resultSummary: summarizeToolResult(execution.result),
@@ -305,6 +333,8 @@ export async function executeSingleToolCall(
   }
 
   const message = execution.error;
+  const wasDenied =
+    execution.status === "approval_required" || execution.status === "denied";
   appendToolError(state, toolCall, name, message);
   const lastEvent = state.events[state.events.length - 1];
   if (lastEvent?.type === "tool_error") {
@@ -312,23 +342,25 @@ export async function executeSingleToolCall(
   }
   await appendToolAuditLog({
     timestamp: new Date().toISOString(),
+    tenantId: state.tenantId ?? undefined,
     sessionId: state.sessionId ?? undefined,
     toolName: name,
     toolCallId: toolCall.id,
-    source: tool?.source,
+    source: toolSource,
     url: typeof args.url === "string" ? args.url : undefined,
     riskLevel: toolRiskLevel,
     permissions: toolPermissions,
     args,
-    outcome: "error",
+    outcome: wasDenied ? "denied" : "error",
     latencyMs: Date.now() - startedAt,
     resultSummary: message,
     detail: message,
   });
   await updateToolCallOutcome({
     sessionId: state.sessionId,
+    tenantId: state.tenantId,
     toolCallId: toolCall.id ?? `${state.step}-${name}`,
-    status: "error",
+    status: wasDenied ? "denied" : "error",
     resultSummary: message,
     errorMessage: message,
     estimatedCostUsd: 0,

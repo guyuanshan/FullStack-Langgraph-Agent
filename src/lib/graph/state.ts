@@ -7,6 +7,7 @@ import type {
   AgentExecutableNode,
   AgentNodeName,
 } from "../agent/state";
+import type { AuthContext } from "../auth/tenant-resolution";
 
 function replaceValue<Value>(defaultValue: () => Value) { // 创建一个替换值的函数，接受一个返回默认值的函数作为参数
   return Annotation<Value>({
@@ -16,8 +17,10 @@ function replaceValue<Value>(defaultValue: () => Value) { // 创建一个替换�
 }
 
 export const AgentGraphState = Annotation.Root({ // 定义一个AgentGraphState的根注解，包含了代理状态的各种属性
+  auth: replaceValue<AuthContext | null>(() => null),
   runId: replaceValue<string | null>(() => null),
   activeStepId: replaceValue<string | null>(() => null),
+  tenantId: replaceValue<string | null>(() => null),
   sessionId: replaceValue<string | null>(() => null),
   messages: replaceValue<ProviderMessage[]>(() => []),
   step: replaceValue<number>(() => 0),

@@ -1,4 +1,5 @@
 import { prisma } from "../db/client";
+import { resolveWriteTenantId } from "../db/tenant";
 import type { AgentObservation, AgentTaskKind } from "./types";
 
 export async function appendAgentTrace(
@@ -7,9 +8,12 @@ export async function appendAgentTrace(
   taskKind: AgentTaskKind,
   observation: AgentObservation
 ) {
+  const tenantId = await resolveWriteTenantId({ sessionId });
+
   await prisma.agentTrace.create({
     data: {
       id: observation.id,
+      tenantId,
       sessionId,
       traceGroupId,
       agentName: observation.agent,

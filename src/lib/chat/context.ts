@@ -1,3 +1,4 @@
+import type { AuthContext } from "../auth/tenant-resolution";
 import {
   CONTEXT_SYSTEM_MESSAGE_PREFIX,
   PROJECT_MEMORY_MESSAGE_PREFIX,
@@ -48,20 +49,28 @@ export function isEphemeralContextMessage(message: SessionMessage) {
   );
 }
 
-export async function buildAgentContext(sessionId: string, latestUserQuery?: string) {
-  const [{ summary }, recentMessages, retrievedMemoryPayload] = await Promise.all([
-    getSessionSummary(sessionId),
-    getSessionMessages(sessionId, {
-      includeSummary: false,
-      recentLimit: RECENT_MESSAGE_WINDOW,
-    }),
-    latestUserQuery?.trim()
-      ? retrieveProjectMemories({
-          query: latestUserQuery,
-          topK: 6,
-        })
-      : Promise.resolve(null),
-  ]);
+export async function buildAgentContext(
+  auth: AuthContext,
+  sessionId: string,
+  latestUserQuery?: string
+) {
+  const [{ summary }, recentMessages, retrievedMemoryPayload] =
+    await Promise.all([
+      getSessionSummary(sessionId, { tenantId: auth.tenantId }),
+      getSessionMessages(sessionId, {
+        tenantId: auth.tenantId,
+        includeSummary: false,
+        recentLimit: RECENT_MESSAGE_WINDOW,
+      }),
+      latestUserQuery?.trim()
+        ? retrieveProjectMemories({
+            query: latestUserQuery,
+            tenantId: auth.tenantId,
+            sessionId,
+            topK: 6,
+          })
+        : Promise.resolve(null),
+    ]);
 
   const context: SessionMessage[] = [createContextSystemMessage()];
 

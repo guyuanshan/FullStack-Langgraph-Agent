@@ -23,16 +23,23 @@ import {
   appendInterruptEvent,
   completeAgentRun,
 } from "../observability/store";
+import type { AuthContext } from "../auth/tenant-resolution";
 
 type RuntimeMessage = ProviderMessage;
 type RuntimeResumeCommand = Command<
   ToolConfirmationResume,
-  Record<string, never>,
+  {
+    auth?: AuthContext | null;
+    tenantId?: string | null;
+    sessionId?: string | null;
+  },
   "callModelNode" | "executeToolsNode"
 >;
 type RuntimeOptions = {
+  auth: AuthContext;
   onFinish?: (messages: RuntimeMessage[]) => void;
   threadId: string;
+  tenantId: string;
   runId?: string;
 };
 
@@ -58,13 +65,17 @@ function enqueueEvents(
 function toRuntimeGraphState(
   values: unknown,
   fallbackMessages: RuntimeMessage[],
-  threadId: string
+  threadId: string,
+  tenantId: string,
+  auth: AuthContext
 ): RuntimeGraphState {
   const defaults = createAgentState(
     structuredClone(fallbackMessages),
     undefined,
     threadId,
-    null
+    null,
+    tenantId,
+    auth
   );
 
   if (!values || typeof values !== "object") {
@@ -76,6 +87,9 @@ function toRuntimeGraphState(
   return {
     ...defaults,
     ...current,
+    auth,
+    tenantId,
+    sessionId: threadId,
     messages: Array.isArray(current.messages)
       ? (current.messages as RuntimeMessage[])
       : defaults.messages,
@@ -88,23 +102,41 @@ function toRuntimeGraphState(
 
 async function loadLatestThreadState(
   threadId: string,
-  fallbackMessages: RuntimeMessage[]
+  tenantId: string,
+  fallbackMessages: RuntimeMessage[],
+  auth: AuthContext
 ) {
   try {
     const snapshot = await getRuntimeThreadState(threadId);
-    return toRuntimeGraphState(snapshot.values, fallbackMessages, threadId);
+    return toRuntimeGraphState(
+      snapshot.values,
+      fallbackMessages,
+      threadId,
+      tenantId,
+      auth
+    );
   } catch {
-    const persistedValues = await getPersistedRuntimeThreadState(threadId);
+    const persistedValues = await getPersistedRuntimeThreadState(threadId, {
+      tenantId,
+    });
 
     if (persistedValues) {
-      return toRuntimeGraphState(persistedValues, fallbackMessages, threadId);
+      return toRuntimeGraphState(
+        persistedValues,
+        fallbackMessages,
+        threadId,
+        tenantId,
+        auth
+      );
     }
 
     return createAgentState(
       structuredClone(fallbackMessages),
       undefined,
       threadId,
-      null
+      null,
+      tenantId,
+      auth
     );
   }
 }
@@ -113,13 +145,19 @@ async function streamLangGraphInput(
   input: RuntimeMessage[] | RuntimeResumeCommand,
   options: RuntimeOptions
 ) {
+  if (!options.tenantId) {
+    throw new Error("tenantId is required to run LangGraph runtime");
+  }
+
   const inputMessages = Array.isArray(input) ? input : [];
   const graphInput = Array.isArray(input)
     ? createAgentState(
         structuredClone(input),
         undefined,
         options.threadId,
-        options.runId ?? null
+        options.runId ?? null,
+        options.tenantId,
+        options.auth
       )
     : input;
 
@@ -129,7 +167,9 @@ async function streamLangGraphInput(
         structuredClone(inputMessages),
         undefined,
         options.threadId,
-        options.runId ?? null
+        options.runId ?? null,
+        options.tenantId,
+        options.auth
       );
 
       try {
@@ -150,13 +190,17 @@ async function streamLangGraphInput(
         });
 
         for await (const chunk of stream as AsyncIterable<RuntimeGraphState>) {
-          if (isInterrupted(chunk)) { // 如果当前块是一个中断，检查是否是工具确认的中断，如果是则发送一个确认请求事件，并等待用户的决策 
-            const interruptPayload = chunk[INTERRUPT][0]?.value; // 获取中断的负载，假设只有一个中断请求
+          if (isInterrupted(chunk)) {
+            const interruptPayload = chunk[INTERRUPT][0]?.value;
 
-            if (isToolConfirmationInterrupt(interruptPayload)) { // 如果中断请求是一个工具确认的中断，发送一个事件到前端，询问用户是否允许执行工具
-              if (latestState.runId) {
-                await appendInterruptEvent({
+            if (isToolConfirmationInterrupt(interruptPayload)) {
+              let approvalId = interruptPayload.approvalId;
+
+              // Fallback: bind a pending approval if the graph node did not.
+              if (!approvalId && latestState.runId) {
+                const pendingApproval = await appendInterruptEvent({
                   runId: latestState.runId,
+                  tenantId: options.tenantId,
                   sessionId: latestState.sessionId,
                   kind: "tool_confirmation",
                   status: "pending",
@@ -165,12 +209,25 @@ async function streamLangGraphInput(
                     toolName: interruptPayload.toolName,
                     toolCallId: interruptPayload.toolCallId,
                     args: interruptPayload.args,
+                    toolSummary: interruptPayload.toolSummary,
+                    riskLevel:
+                      interruptPayload.toolRiskLevel ?? "dangerous",
+                    permissions: interruptPayload.toolPermissions ?? [],
                   },
                 });
+                approvalId = pendingApproval.id;
               }
+
+              if (!approvalId) {
+                throw new Error(
+                  "Tool confirmation is missing a server approvalId."
+                );
+              }
+
               controller.enqueue(
                 encodeSSE({
                   type: "confirm_request",
+                  approvalId,
                   toolName: interruptPayload.toolName,
                   toolCallId: interruptPayload.toolCallId,
                   args: interruptPayload.args,
@@ -182,11 +239,15 @@ async function streamLangGraphInput(
               );
             }
 
-            latestState = await loadLatestThreadState( // 在等待用户决策的过程中，持续加载最新的线程状态，以便在用户做出决策后能够获取到最新的状态
+            latestState = await loadLatestThreadState(
               options.threadId,
-              inputMessages
+              options.tenantId,
+              inputMessages,
+              options.auth
             );
-            await persistRuntimeThreadState(options.threadId);
+            await persistRuntimeThreadState(options.threadId, {
+              tenantId: options.tenantId,
+            });
             if (latestState.runId) {
               controller.enqueue(
                 encodeSSE({
@@ -198,16 +259,23 @@ async function streamLangGraphInput(
               );
               await completeAgentRun({
                 runId: latestState.runId,
+                tenantId: options.tenantId,
+                sessionId: options.threadId,
                 status: "interrupted",
                 completionReason: "interrupted",
               });
             }
-            options.onFinish?.(structuredClone(latestState.messages)); // 在用户做出决策后，调用 onFinish 回调函数，传入最新状态的消息列表
+            options.onFinish?.(structuredClone(latestState.messages));
             controller.close();
             return;
           }
 
-          latestState = chunk; // 如果当前块不是一个中断，说明是一个正常的状态更新，直接将其中的事件发送到前端，并更新最新的状态
+          latestState = {
+            ...chunk,
+            auth: options.auth,
+            tenantId: options.tenantId,
+            sessionId: options.threadId,
+          };
 
           const nextEvents = chunk.events ?? [];
           if (nextEvents.length > 0) {
@@ -215,8 +283,15 @@ async function streamLangGraphInput(
           }
         }
 
-        latestState = await loadLatestThreadState(options.threadId, inputMessages);
-        await persistRuntimeThreadState(options.threadId);
+        latestState = await loadLatestThreadState(
+          options.threadId,
+          options.tenantId,
+          inputMessages,
+          options.auth
+        );
+        await persistRuntimeThreadState(options.threadId, {
+          tenantId: options.tenantId,
+        });
         if (latestState.runId) {
           controller.enqueue(
             encodeSSE({
@@ -228,6 +303,8 @@ async function streamLangGraphInput(
           );
           await completeAgentRun({
             runId: latestState.runId,
+            tenantId: options.tenantId,
+            sessionId: options.threadId,
             status: "completed",
             completionReason: latestState.completionReason ?? "completed",
           });
@@ -257,6 +334,7 @@ async function streamLangGraphInput(
           );
           await appendErrorLog({
             runId: latestState.runId,
+            tenantId: options.tenantId,
             sessionId: latestState.sessionId,
             source: "langgraph_runtime",
             error,
@@ -266,6 +344,8 @@ async function streamLangGraphInput(
           });
           await completeAgentRun({
             runId: latestState.runId,
+            tenantId: options.tenantId,
+            sessionId: options.threadId,
             status: "error",
             completionReason: "error",
             errorMessage: getErrorMessage(error),
@@ -298,9 +378,20 @@ export async function resumeLangGraphRuntime(
   return streamLangGraphInput(
     new Command<
       ToolConfirmationResume,
-      Record<string, never>,
+      {
+        auth?: AuthContext | null;
+        tenantId?: string | null;
+        sessionId?: string | null;
+      },
       "callModelNode" | "executeToolsNode"
-    >({ resume }),
+    >({
+      resume,
+      update: {
+        auth: options.auth,
+        tenantId: options.tenantId,
+        sessionId: options.threadId,
+      },
+    }),
     options
   );
 }

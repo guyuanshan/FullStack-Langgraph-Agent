@@ -3,7 +3,10 @@ import {
 } from "../code-agent/project";
 import { searchProjectCode } from "../code-agent/search";
 import { readProjectFiles } from "../code-agent/read";
-import { createPatchProposal } from "../code-agent/proposals";
+import {
+  applyPatchProposal,
+  createPatchProposal,
+} from "../code-agent/proposals";
 import { runProjectChecks } from "../code-agent/commands";
 import {
   buildPullRequestSummary,
@@ -12,6 +15,7 @@ import {
   getGitStatusSummary,
   pushGitBranch,
 } from "../code-agent/git";
+import { prisma } from "../db/client";
 import {
   indexProjectMemory,
   refreshProjectMemory,
@@ -19,11 +23,34 @@ import {
 } from "../project-memory";
 import type { ToolDefinition } from "./types";
 
+async function resolveTenantFromAgentSession(sessionId: string | null) {
+  if (!sessionId) {
+    throw new Error("agentSessionId is required for tenant-scoped tools");
+  }
+
+  const session = await prisma.session.findUnique({
+    where: {
+      id: sessionId,
+    },
+    select: {
+      tenantId: true,
+      userId: true,
+    },
+  });
+
+  if (!session) {
+    throw new Error(`Unknown agent session: ${sessionId}`);
+  }
+
+  return session;
+}
+
 export const projectSummaryTool: ToolDefinition = {
   name: "project_index_summary",
   description:
     "Scan the project structure, inspect package.json, tsconfig.json, and README.md, detect the tech stack, and return a compact project summary.",
   source: "local",
+  riskLevel: "safe",
   permissions: ["read"],
   parameters: {
     type: "object",
@@ -39,6 +66,7 @@ export const projectSearchTool: ToolDefinition = {
   description:
     "Search the codebase by file name, keyword, symbol, or general query. Use this to locate functions, components, routes, and relevant files.",
   source: "local",
+  riskLevel: "safe",
   permissions: ["read"],
   parameters: {
     type: "object",
@@ -88,6 +116,7 @@ export const projectReadFilesTool: ToolDefinition = {
   description:
     "Read a selected set of project files and return compact file contents for LLM context assembly.",
   source: "local",
+  riskLevel: "safe",
   permissions: ["read"],
   parameters: {
     type: "object",
@@ -120,7 +149,8 @@ export const projectMemoryIndexTool: ToolDefinition = {
   description:
     "Scan the current project, chunk important files and docs, generate embeddings, and persist project-level memory for future retrieval.",
   source: "local",
-  permissions: ["read"],
+  riskLevel: "confirm_required",
+  permissions: ["read", "write"],
   parameters: {
     type: "object",
     properties: {
@@ -143,7 +173,13 @@ export const projectMemoryIndexTool: ToolDefinition = {
           }) => void)
         : undefined;
 
+    const sessionId =
+      typeof args.agentSessionId === "string" ? args.agentSessionId : null;
+    const session = await resolveTenantFromAgentSession(sessionId);
+
     return indexProjectMemory({
+      tenantId: session.tenantId,
+      sessionId,
       embeddingProvider:
         typeof args.embeddingProvider === "string"
           ? args.embeddingProvider
@@ -158,6 +194,7 @@ export const projectMemorySearchTool: ToolDefinition = {
   description:
     "Search project-level long-term memory using semantic similarity. Useful for tech stack, architecture, prior fixes, and related code chunks.",
   source: "local",
+  riskLevel: "safe",
   permissions: ["read"],
   parameters: {
     type: "object",
@@ -183,8 +220,14 @@ export const projectMemorySearchTool: ToolDefinition = {
       throw new Error("Tool project_memory_search requires a string query");
     }
 
+    const sessionId =
+      typeof args.agentSessionId === "string" ? args.agentSessionId : null;
+    const session = await resolveTenantFromAgentSession(sessionId);
+
     return retrieveProjectMemories({
       query: args.query,
+      tenantId: session.tenantId,
+      sessionId,
       topK: typeof args.topK === "number" ? args.topK : undefined,
       embeddingProvider:
         typeof args.embeddingProvider === "string"
@@ -199,7 +242,8 @@ export const projectMemoryRefreshTool: ToolDefinition = {
   description:
     "Refresh project memory for a specific set of changed files after edits, replacing old embeddings for those paths.",
   source: "local",
-  permissions: ["read"],
+  riskLevel: "confirm_required",
+  permissions: ["read", "write"],
   parameters: {
     type: "object",
     properties: {
@@ -230,8 +274,14 @@ export const projectMemoryRefreshTool: ToolDefinition = {
           }) => void)
         : undefined;
 
+    const sessionId =
+      typeof args.agentSessionId === "string" ? args.agentSessionId : null;
+    const session = await resolveTenantFromAgentSession(sessionId);
+
     return refreshProjectMemory({
       paths: Array.isArray(args.paths) ? (args.paths as string[]) : [],
+      tenantId: session.tenantId,
+      sessionId,
       embeddingProvider:
         typeof args.embeddingProvider === "string"
           ? args.embeddingProvider
@@ -246,6 +296,7 @@ export const codeProposePatchTool: ToolDefinition = {
   description:
     "Create a code patch proposal without writing files. Provide full new file content for each file to change, and the tool will return a diff preview proposal for user review.",
   source: "local",
+  riskLevel: "safe",
   permissions: ["read"],
   parameters: {
     type: "object",
@@ -298,12 +349,67 @@ export const codeProposePatchTool: ToolDefinition = {
         )
       : [];
 
+    const sessionId =
+      typeof args.agentSessionId === "string" ? args.agentSessionId : null;
+    const session = await resolveTenantFromAgentSession(sessionId);
+
     return createPatchProposal({
-      sessionId:
-        typeof args.agentSessionId === "string" ? args.agentSessionId : null,
+      tenantId: session.tenantId,
+      userId: session.userId,
+      sessionId,
       title: args.title,
       summary: typeof args.summary === "string" ? args.summary : undefined,
       files,
+    });
+  },
+};
+
+/**
+ * Approval APIs use this internal registration so applying a patch crosses the
+ * same authorization Gateway as model-selected tools without exposing the
+ * apply operation to model tool selection.
+ */
+export const codeApplyPatchTool: ToolDefinition = {
+  name: "code_apply_patch",
+  description: "Apply an approved code patch proposal.",
+  source: "local",
+  riskLevel: "confirm_required",
+  permissions: ["write"],
+  parameters: {
+    type: "object",
+    properties: {
+      proposalId: {
+        type: "string",
+        description: "Server-issued patch proposal id",
+      },
+      files: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            path: { type: "string" },
+            content: { type: "string" },
+          },
+          required: ["path", "content"],
+        },
+      },
+    },
+    required: ["proposalId"],
+  },
+  async execute(args) {
+    if (typeof args.proposalId !== "string") {
+      throw new Error("Tool code_apply_patch requires a proposalId");
+    }
+    if (typeof args.tenantId !== "string") {
+      throw new Error("Tool code_apply_patch requires an injected tenantId");
+    }
+
+    return applyPatchProposal({
+      proposalId: args.proposalId,
+      tenantId: args.tenantId,
+      files: Array.isArray(args.files)
+        ? (args.files as Array<{ path: string; content: string }>)
+        : undefined,
     });
   },
 };
@@ -345,6 +451,7 @@ export const gitStatusSummaryTool: ToolDefinition = {
   description:
     "Inspect the current git branch, changed files, and diff stat for the local project.",
   source: "local",
+  riskLevel: "safe",
   permissions: ["read"],
   parameters: {
     type: "object",
@@ -429,7 +536,7 @@ export const gitPushBranchTool: ToolDefinition = {
   description:
     "Push the current or specified branch to a remote and set upstream tracking.",
   source: "local",
-  riskLevel: "confirm_required",
+  riskLevel: "dangerous",
   permissions: ["execute"],
   parameters: {
     type: "object",
@@ -458,6 +565,7 @@ export const gitPreparePrSummaryTool: ToolDefinition = {
   description:
     "Summarize the current branch diff and commits compared to a base branch, and suggest a PR title/body.",
   source: "local",
+  riskLevel: "safe",
   permissions: ["read"],
   parameters: {
     type: "object",

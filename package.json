@@ -7,9 +7,15 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test": "node --import ./scripts/stub-server-only.mjs --import tsx --test src/lib/auth/tenant-resolution.test.ts src/lib/auth/origin.test.ts src/lib/db/tenant-access.test.ts src/lib/code-agent/proposals.tenant.test.ts src/lib/api/schemas.test.ts src/lib/api/pending-approvals.db.test.ts src/lib/tools/authorization/gateway.test.ts src/lib/tools/authorization/policy.test.ts src/lib/file-sandbox/path-policy.test.ts",
+    "auth:bootstrap": "node --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/bootstrap-auth.mjs",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
-    "db:push": "prisma db push"
+    "db:push": "prisma db push",
+    "db:verify-tenant": "node --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/verify-tenant-backfill.mjs",
+    "db:ensure-admin": "node --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/ensure-default-tenant-admin.mjs",
+    "db:setup": "prisma migrate deploy && prisma generate && node --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/ensure-default-tenant-admin.mjs",
+    "db:tenant-drill": "node --env-file-if-exists=.env --env-file-if-exists=.env.local scripts/tenant-migration-drill.mjs"
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.73",
@@ -18,6 +24,7 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@prisma/client": "^6.19.0",
     "ai": "^6.0.180",
+    "better-auth": "1.6.25",
     "next": "16.2.6",
     "openai": "^6.37.0",
     "playwright": "^1.60.0",
@@ -34,6 +41,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.2.6",
     "tailwindcss": "^4",
+    "tsx": "^4.20.5",
     "typescript": "^5"
   }
 }

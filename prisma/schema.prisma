@@ -9,25 +9,112 @@ datasource db {
 }
 
 model User {
-  id        String    @id @default(cuid())
-  email     String?   @unique
-  name      String?
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-  sessions  Session[]
+  id                String         @id @default(cuid())
+  email             String         @unique
+  emailVerified     Boolean        @default(false)
+  name              String
+  image             String?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  sessions          Session[]
+  authSessions      AuthSession[]
+  authAccounts      AuthAccount[]
+  tenantMemberships TenantMember[]
+}
+
+model AuthSession {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model AuthAccount {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([providerId, accountId])
+  @@index([userId])
+}
+
+model AuthVerification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+}
+
+model Tenant {
+  id              String           @id @default(cuid())
+  name            String
+  isActive        Boolean          @default(true)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  memberships     TenantMember[]
+  sessions        Session[]
+  projectMemories ProjectMemory[]
+  auditLogs       AuditLog[]
+  agentRuns       AgentRun[]
+  agentSteps      AgentStep[]
+  interruptEvents InterruptEvent[]
+  errorLogs       ErrorLog[]
+  modelCalls      ModelCall[]
+  toolCalls       ToolCall[]
+  checkpoints     Checkpoint[]
+  messages        Message[]
+  agentTraces     AgentTrace[]
+}
+
+model TenantMember {
+  id        String   @id @default(cuid())
+  tenantId  String
+  userId    String
+  role      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, userId])
+  @@index([userId, tenantId])
 }
 
 model Session {
-  id               String                 @id
+  id               String           @id
+  tenantId         String
   userId           String?
   title            String?
   summary          String?
   summaryUpdatedAt DateTime?
-  messageCount     Int                    @default(0)
+  messageCount     Int              @default(0)
   lastMessageAt    DateTime?
-  createdAt        DateTime               @default(now())
-  updatedAt        DateTime               @updatedAt
-  user             User?                  @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  tenant           Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  user             User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
   messages         Message[]
   toolCalls        ToolCall[]
   checkpoints      Checkpoint[]
@@ -38,29 +125,39 @@ model Session {
   interruptEvents  InterruptEvent[]
   errorLogs        ErrorLog[]
   modelCalls       ModelCall[]
+
+  // Enables composite foreign keys from child rows (tenantId, sessionId).
+  @@unique([tenantId, id])
+  @@index([tenantId, createdAt])
+  @@index([tenantId, updatedAt])
+  @@index([tenantId, userId, updatedAt])
 }
 
 model ProjectMemory {
-  id          String   @id @default(cuid())
-  projectId   String
-  type        String
-  sourcePath  String?
-  chunkKey    String
-  title       String?
-  content     String
-  embedding   String
+  id           String   @id @default(cuid())
+  tenantId     String
+  projectId    String
+  type         String
+  sourcePath   String?
+  chunkKey     String
+  title        String?
+  content      String
+  embedding    String
   metadataJson String?
-  contentHash String
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  contentHash  String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  @@unique([projectId, chunkKey])
-  @@index([projectId, type, updatedAt])
-  @@index([projectId, sourcePath])
+  @@unique([tenantId, projectId, chunkKey])
+  @@index([tenantId, projectId, type, updatedAt])
+  @@index([tenantId, projectId, sourcePath])
+  @@index([tenantId, createdAt])
 }
 
 model Message {
   id         String   @id @default(cuid())
+  tenantId   String
   sessionId  String
   orderIndex Int
   role       String
@@ -68,58 +165,70 @@ model Message {
   rawJson    String
   archived   Boolean  @default(false)
   createdAt  DateTime @default(now())
-  session    Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  session    Session  @relation(fields: [tenantId, sessionId], references: [tenantId, id], onDelete: Cascade)
 
   @@unique([sessionId, orderIndex])
   @@index([sessionId, archived, orderIndex])
   @@index([sessionId, createdAt])
+  @@index([tenantId, sessionId, createdAt])
 }
 
 model ToolCall {
-  id            String   @id
-  sessionId     String
-  runId         String?
-  stepId        String?
-  toolName      String
-  status        String
-  source        String?
-  riskLevel     String?
-  permissions   String?
-  approvedByUser Boolean?
-  argsJson      String?
-  resultSummary String?
-  resultJson    String?
-  errorMessage  String?
+  id               String     @id
+  tenantId         String
+  sessionId        String
+  runId            String?
+  stepId           String?
+  toolName         String
+  status           String
+  source           String?
+  riskLevel        String?
+  permissions      String?
+  approvedByUser   Boolean?
+  argsJson         String?
+  resultSummary    String?
+  resultJson       String?
+  errorMessage     String?
   estimatedCostUsd Float?
-  startedAt     DateTime @default(now())
-  finishedAt    DateTime?
-  latencyMs     Int?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-  session       Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
-  run           AgentRun? @relation(fields: [runId], references: [id], onDelete: SetNull)
-  step          AgentStep? @relation(fields: [stepId], references: [id], onDelete: SetNull)
-  auditLogs     AuditLog[]
+  startedAt        DateTime   @default(now())
+  finishedAt       DateTime?
+  latencyMs        Int?
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+  tenant           Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  session          Session    @relation(fields: [tenantId, sessionId], references: [tenantId, id], onDelete: Cascade)
+  // Optional parents keep single-column FKs (SetNull). Tenant match is enforced by DB triggers.
+  run              AgentRun?  @relation(fields: [runId], references: [id], onDelete: SetNull)
+  step             AgentStep? @relation(fields: [stepId], references: [id], onDelete: SetNull)
+  auditLogs        AuditLog[]
 
+  @@unique([tenantId, id])
   @@index([sessionId, createdAt])
   @@index([runId, createdAt])
   @@index([stepId, createdAt])
+  @@index([tenantId, sessionId, createdAt])
+  @@index([tenantId, createdAt])
 }
 
 model Checkpoint {
   id        String   @id @default(cuid())
+  tenantId  String
   sessionId String
   threadId  String
   payload   String
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-  session   Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  session   Session  @relation(fields: [tenantId, sessionId], references: [tenantId, id], onDelete: Cascade)
 
   @@unique([sessionId, threadId])
+  @@index([tenantId, sessionId, createdAt])
 }
 
 model AuditLog {
-  id            String   @id @default(cuid())
+  id            String    @id @default(cuid())
+  tenantId      String
   sessionId     String?
   toolCallId    String?
   toolName      String
@@ -132,16 +241,21 @@ model AuditLog {
   resultSummary String?
   detail        String?
   latencyMs     Int?
-  createdAt     DateTime @default(now())
+  createdAt     DateTime  @default(now())
+  tenant        Tenant    @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  // Optional parents: single-column FKs + tenant-consistency triggers.
   session       Session?  @relation(fields: [sessionId], references: [id], onDelete: SetNull)
   toolCall      ToolCall? @relation(fields: [toolCallId], references: [id], onDelete: SetNull)
 
   @@index([sessionId, createdAt])
   @@index([toolCallId, createdAt])
+  @@index([tenantId, createdAt])
+  @@index([tenantId, sessionId, createdAt])
 }
 
 model AgentTrace {
   id           String   @id @default(cuid())
+  tenantId     String
   sessionId    String
   traceGroupId String
   agentName    String
@@ -152,14 +266,17 @@ model AgentTrace {
   toolCount    Int?
   detailJson   String?
   createdAt    DateTime @default(now())
-  session      Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  session      Session  @relation(fields: [tenantId, sessionId], references: [tenantId, id], onDelete: Cascade)
 
   @@index([sessionId, createdAt])
   @@index([traceGroupId, createdAt])
+  @@index([tenantId, sessionId, createdAt])
 }
 
 model AgentRun {
   id               String           @id
+  tenantId         String
   sessionId        String?
   runtimeType      String
   trigger          String
@@ -171,6 +288,7 @@ model AgentRun {
   startedAt        DateTime         @default(now())
   finishedAt       DateTime?
   latencyMs        Int?
+  tenant           Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
   session          Session?         @relation(fields: [sessionId], references: [id], onDelete: SetNull)
   steps            AgentStep[]
   interrupts       InterruptEvent[]
@@ -178,12 +296,16 @@ model AgentRun {
   modelCalls       ModelCall[]
   toolCalls        ToolCall[]
 
+  @@unique([tenantId, id])
   @@index([sessionId, startedAt])
   @@index([status, startedAt])
+  @@index([tenantId, startedAt])
+  @@index([tenantId, sessionId, startedAt])
 }
 
 model AgentStep {
-  id            String    @id @default(cuid())
+  id            String           @id @default(cuid())
+  tenantId      String
   runId         String
   sessionId     String?
   agentName     String?
@@ -192,22 +314,26 @@ model AgentStep {
   stepType      String
   inputSummary  String?
   outputSummary String?
-  startedAt     DateTime  @default(now())
+  startedAt     DateTime         @default(now())
   finishedAt    DateTime?
   latencyMs     Int?
-  run           AgentRun  @relation(fields: [runId], references: [id], onDelete: Cascade)
-  session       Session?  @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  tenant        Tenant           @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  run           AgentRun         @relation(fields: [tenantId, runId], references: [tenantId, id], onDelete: Cascade)
+  session       Session?         @relation(fields: [sessionId], references: [id], onDelete: SetNull)
   errors        ErrorLog[]
   interrupts    InterruptEvent[]
   modelCalls    ModelCall[]
   toolCalls     ToolCall[]
 
+  @@unique([tenantId, id])
   @@index([runId, startedAt])
   @@index([sessionId, startedAt])
+  @@index([tenantId, sessionId, startedAt])
 }
 
 model InterruptEvent {
-  id          String    @id @default(cuid())
+  id          String     @id @default(cuid())
+  tenantId    String
   runId       String
   stepId      String?
   sessionId   String?
@@ -216,18 +342,21 @@ model InterruptEvent {
   message     String?
   payloadJson String?
   reason      String?
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
-  run         AgentRun  @relation(fields: [runId], references: [id], onDelete: Cascade)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  tenant      Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  run         AgentRun   @relation(fields: [tenantId, runId], references: [tenantId, id], onDelete: Cascade)
   step        AgentStep? @relation(fields: [stepId], references: [id], onDelete: SetNull)
-  session     Session?  @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  session     Session?   @relation(fields: [sessionId], references: [id], onDelete: SetNull)
 
   @@index([runId, createdAt])
   @@index([sessionId, createdAt])
+  @@index([tenantId, sessionId, createdAt])
 }
 
 model ErrorLog {
-  id          String    @id @default(cuid())
+  id          String     @id @default(cuid())
+  tenantId    String
   runId       String?
   stepId      String?
   sessionId   String?
@@ -235,39 +364,44 @@ model ErrorLog {
   message     String
   stack       String?
   contextJson String?
-  createdAt   DateTime  @default(now())
-  run         AgentRun? @relation(fields: [runId], references: [id], onDelete: SetNull)
+  createdAt   DateTime   @default(now())
+  tenant      Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  run         AgentRun?  @relation(fields: [runId], references: [id], onDelete: SetNull)
   step        AgentStep? @relation(fields: [stepId], references: [id], onDelete: SetNull)
-  session     Session?  @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  session     Session?   @relation(fields: [sessionId], references: [id], onDelete: SetNull)
 
   @@index([runId, createdAt])
   @@index([sessionId, createdAt])
+  @@index([tenantId, createdAt])
 }
 
 model ModelCall {
-  id                String    @id @default(cuid())
-  runId             String
-  stepId            String?
-  sessionId         String?
-  agentName         String?
-  nodeName          String?
-  provider          String
-  model             String
-  promptTokens      Int?
-  completionTokens  Int?
-  reasoningTokens   Int?
-  estimatedCostUsd  Float?
-  latencyMs         Int?
-  status            String
-  inputSummary      String?
-  outputSummary     String?
-  errorMessage      String?
-  createdAt         DateTime  @default(now())
-  finishedAt        DateTime?
-  run               AgentRun  @relation(fields: [runId], references: [id], onDelete: Cascade)
-  step              AgentStep? @relation(fields: [stepId], references: [id], onDelete: SetNull)
-  session           Session?  @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  id               String     @id @default(cuid())
+  tenantId         String
+  runId            String
+  stepId           String?
+  sessionId        String?
+  agentName        String?
+  nodeName         String?
+  provider         String
+  model            String
+  promptTokens     Int?
+  completionTokens Int?
+  reasoningTokens  Int?
+  estimatedCostUsd Float?
+  latencyMs        Int?
+  status           String
+  inputSummary     String?
+  outputSummary    String?
+  errorMessage     String?
+  createdAt        DateTime   @default(now())
+  finishedAt       DateTime?
+  tenant           Tenant     @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  run              AgentRun   @relation(fields: [tenantId, runId], references: [tenantId, id], onDelete: Cascade)
+  step             AgentStep? @relation(fields: [stepId], references: [id], onDelete: SetNull)
+  session          Session?   @relation(fields: [sessionId], references: [id], onDelete: SetNull)
 
   @@index([runId, createdAt])
   @@index([sessionId, createdAt])
+  @@index([tenantId, sessionId, createdAt])
 }

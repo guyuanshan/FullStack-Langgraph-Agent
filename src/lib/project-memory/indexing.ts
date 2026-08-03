@@ -6,6 +6,8 @@ import { resolveEmbeddingProvider } from "./embedding";
 import { refreshProjectMemoryPaths, replaceProjectMemory } from "./store";
 
 export async function indexProjectMemory(options?: {
+  tenantId?: string;
+  sessionId?: string | null;
   embeddingProvider?: string;
   onProgress?: (event: {
     phase: "scanning" | "embedding";
@@ -23,6 +25,8 @@ export async function indexProjectMemory(options?: {
     total: chunks.length,
   });
   const result = await replaceProjectMemory(projectId, chunks, {
+    tenantId: options?.tenantId,
+    sessionId: options?.sessionId,
     embeddingProvider: provider,
     onProgress: options?.onProgress,
   });
@@ -36,6 +40,8 @@ export async function indexProjectMemory(options?: {
 
 export async function refreshProjectMemory(options: {
   paths: string[];
+  tenantId?: string;
+  sessionId?: string | null;
   embeddingProvider?: string;
   onProgress?: (event: {
     phase: "scanning" | "embedding";
@@ -54,6 +60,8 @@ export async function refreshProjectMemory(options: {
     total: chunks.length,
   });
   const result = await refreshProjectMemoryPaths(projectId, chunks, uniquePaths, {
+    tenantId: options.tenantId,
+    sessionId: options.sessionId,
     embeddingProvider: provider,
     onProgress: options.onProgress,
   });

@@ -13,6 +13,7 @@ import type {
   SubtaskResult,
 } from "./types";
 import { classifyTaskKind } from "./router";
+import type { AuthContext } from "../auth/tenant-resolution";
 
 function replaceValue<Value>(defaultValue: () => Value) {
   return Annotation<Value>({
@@ -22,8 +23,10 @@ function replaceValue<Value>(defaultValue: () => Value) {
 }
 
 export const MultiAgentGraphState = Annotation.Root({
+  auth: replaceValue<AuthContext | null>(() => null),
   runId: replaceValue<string | null>(() => null),
   activeStepId: replaceValue<string | null>(() => null),
+  tenantId: replaceValue<string | null>(() => null),
   sessionId: replaceValue<string | null>(() => null),
   messages: replaceValue<ProviderMessage[]>(() => []),
   events: () => new EphemeralValue<StreamEvent[]>(),
@@ -49,7 +52,9 @@ export function createMultiAgentState(
   messages: ProviderMessage[],
   sessionId: string | null,
   requirePlanApproval = false,
-  runId: string | null = null
+  runId: string | null = null,
+  tenantId: string | null = null,
+  auth: AuthContext | null = null
 ): MultiAgentState {
   const latestUserTask = [...messages]
     .reverse()
@@ -57,8 +62,10 @@ export function createMultiAgentState(
     ?.content as string | undefined;
 
   return {
+    auth,
     runId,
     activeStepId: null,
+    tenantId,
     sessionId,
     messages,
     events: [],

@@ -6,10 +6,14 @@ function parseStoredMessage(rawJson: string) {
   return JSON.parse(rawJson) as SessionMessage;
 }
 
-export async function getSessionSummary(sessionId: string) {
-  const session = await prisma.session.findUnique({
+export async function getSessionSummary(
+  sessionId: string,
+  options: { tenantId: string }
+) {
+  const session = await prisma.session.findFirst({
     where: {
       id: sessionId,
+      tenantId: options.tenantId,
     },
     select: {
       summary: true,
@@ -22,11 +26,13 @@ export async function getSessionSummary(sessionId: string) {
 
 export async function updateSessionSummary(
   sessionId: string,
-  summary: string | null
+  summary: string | null,
+  options: { tenantId: string }
 ) {
-  await prisma.session.update({
+  await prisma.session.updateMany({
     where: {
       id: sessionId,
+      tenantId: options.tenantId,
     },
     data: {
       summary,
@@ -35,11 +41,15 @@ export async function updateSessionSummary(
   });
 }
 
-export async function getMessageCount(sessionId: string, options?: { archived?: boolean }) {
+export async function getMessageCount(
+  sessionId: string,
+  options: { tenantId: string; archived?: boolean }
+) {
   return prisma.message.count({
     where: {
+      tenantId: options.tenantId,
       sessionId,
-      ...(typeof options?.archived === "boolean"
+      ...(typeof options.archived === "boolean"
         ? {
             archived: options.archived,
           }
@@ -50,14 +60,16 @@ export async function getMessageCount(sessionId: string, options?: { archived?: 
 
 export async function getOldMessagesForSummary(
   sessionId: string,
-  options?: {
+  options: {
+    tenantId: string;
     preserveRecent?: number;
     limit?: number;
   }
 ) {
-  const preserveRecent = options?.preserveRecent ?? RECENT_MESSAGE_WINDOW;
-  const limit = options?.limit ?? 200;
+  const preserveRecent = options.preserveRecent ?? RECENT_MESSAGE_WINDOW;
+  const limit = options.limit ?? 200;
   const activeCount = await getMessageCount(sessionId, {
+    tenantId: options.tenantId,
     archived: false,
   });
 
@@ -68,6 +80,7 @@ export async function getOldMessagesForSummary(
   const take = Math.min(activeCount - preserveRecent, limit);
   const rows = await prisma.message.findMany({
     where: {
+      tenantId: options.tenantId,
       sessionId,
       archived: false,
     },
@@ -84,13 +97,18 @@ export async function getOldMessagesForSummary(
   }));
 }
 
-export async function archiveMessagesById(messageIds: string[]) {
+export async function archiveMessagesById(
+  messageIds: string[],
+  options: { tenantId: string; sessionId: string }
+) {
   if (messageIds.length === 0) {
     return 0;
   }
 
   const result = await prisma.message.updateMany({
     where: {
+      tenantId: options.tenantId,
+      sessionId: options.sessionId,
       id: {
         in: messageIds,
       },

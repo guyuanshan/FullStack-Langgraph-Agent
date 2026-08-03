@@ -1,11 +1,13 @@
 export { buildAgentContext, isEphemeralContextMessage } from "./context";
 export {
-  deleteSession,
   ensureSession,
   getFullSessionMessages,
   getSessionMessages,
-  listSessions,
   setSessionMessages,
   type SessionMessage,
 } from "./session-store";
+export {
+  deleteSession,
+  listSessions,
+} from "../db/tenant-access";
 export { maybeSummarizeSession } from "./summarizer";

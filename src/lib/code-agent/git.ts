@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { WORKSPACE_ROOT, validateWorkspacePath } from "./workspace";
+import { getDefaultSandboxContext, WORKSPACE_ROOT } from "./workspace";
+import { validateWorkspacePath } from "../file-sandbox";
 
 const execFileAsync = promisify(execFile);
 
@@ -16,6 +17,62 @@ function splitLines(value: string) {
     .split("\n")
     .map((line) => line.trimEnd())
     .filter(Boolean);
+}
+
+function normalizeRemoteName(value?: string) {
+  const remote = value?.trim() || "origin";
+
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(remote)) {
+    throw new Error("Git remote contains unsupported characters");
+  }
+
+  return remote;
+}
+
+function redactRemoteCredentials(remoteUrl: string) {
+  try {
+    const parsed = new URL(remoteUrl);
+
+    if (parsed.username || parsed.password) {
+      parsed.username = parsed.username ? "***" : "";
+      parsed.password = "";
+    }
+
+    return parsed.toString();
+  } catch {
+    return remoteUrl.replace(/^(https?:\/\/)[^/@\s]+@/i, "$1***@");
+  }
+}
+
+export async function getGitPushTarget(options: {
+  remote?: string;
+  branchName?: string;
+}) {
+  const remote = normalizeRemoteName(options.remote);
+  const branch =
+    options.branchName?.trim() ||
+    (await runGitCommand(["branch", "--show-current"])).stdout.trim();
+
+  if (!branch) {
+    throw new Error("Branch name is required to push");
+  }
+
+  const { stdout: remoteUrlStdout } = await runGitCommand([
+    "remote",
+    "get-url",
+    remote,
+  ]);
+  const remoteUrl = remoteUrlStdout.trim();
+
+  if (!remoteUrl) {
+    throw new Error(`Git remote ${remote} has no configured URL`);
+  }
+
+  return {
+    remote,
+    branch,
+    repository: redactRemoteCredentials(remoteUrl),
+  };
 }
 
 export async function getGitStatusSummary() {
@@ -73,8 +130,15 @@ export async function createGitCommit(options: {
     throw new Error("Commit message is required");
   }
 
+  const sandbox = getDefaultSandboxContext("read");
   const validatedPaths =
-    options.paths?.map((input) => validateWorkspacePath(input).relativePath) ?? [];
+    options.paths?.map(
+      (input) =>
+        validateWorkspacePath(sandbox, input, {
+          allowRoot: false,
+          access: "read",
+        }).relativePath
+    ) ?? [];
 
   if (validatedPaths.length > 0) {
     await runGitCommand(["add", "--", ...validatedPaths]);
@@ -102,21 +166,20 @@ export async function pushGitBranch(options: {
   remote?: string;
   branchName?: string;
 }) {
-  const remote = options.remote?.trim() || "origin";
-  const branchName =
-    options.branchName?.trim() ||
-    (await runGitCommand(["branch", "--show-current"])).stdout.trim();
+  const target = await getGitPushTarget(options);
 
-  if (!branchName) {
-    throw new Error("Branch name is required to push");
-  }
-
-  const { stdout } = await runGitCommand(["push", "-u", remote, branchName]);
+  const { stdout } = await runGitCommand([
+    "push",
+    "-u",
+    target.remote,
+    target.branch,
+  ]);
 
   return {
     kind: "git_push_result",
-    remote,
-    branch: branchName,
+    remote: target.remote,
+    branch: target.branch,
+    repository: target.repository,
     output: stdout.trim(),
   };
 }

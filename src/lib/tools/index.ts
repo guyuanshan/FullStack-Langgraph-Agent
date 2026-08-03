@@ -1,6 +1,7 @@
 import { weatherTool } from "./weather";
 import { writeDemoFileTool } from "./write-demo-file";
 import {
+  codeApplyPatchTool,
   codeProposePatchTool,
   gitCommitChangesTool,
   gitCreateBranchTool,
@@ -16,11 +17,7 @@ import {
   runProjectChecksTool,
 } from "./code-agent";
 import { getMcpProviderTools, getMcpTools } from "../mcp/client";
-import type {
-  ToolArgs,
-  ToolDefinition,
-  ToolExecutionResult,
-} from "./types";
+import type { ToolDefinition } from "./types";
 
 function createToolsMap(tools: ToolDefinition[]) { // 创建工具映射表，确保工具名称唯一
   const nextMap = new Map<string, ToolDefinition>();
@@ -71,11 +68,26 @@ export const localToolRegistry = registerTools([
   gitPreparePrSummaryTool,
 ]); // 在这里注册本地工具，包含基础工具和 code agent 能力
 
+const internalToolRegistry = registerTools([
+  codeApplyPatchTool,
+]);
+
 export const registeredTools = localToolRegistry.tools; // 导出已注册的本地工具列表
+
+export function getLocalRegisteredTools() {
+  return [
+    ...localToolRegistry.tools,
+    ...internalToolRegistry.tools,
+  ];
+}
 
 export async function getRegisteredTools() {
   const mcpTools = await getMcpTools();
-  return [...localToolRegistry.tools, ...mcpTools];
+  return [
+    ...localToolRegistry.tools,
+    ...internalToolRegistry.tools,
+    ...mcpTools,
+  ];
 }
 
 export async function getProviderTools() { // 导出提供给代理使用的工具定义列表，包含本地工具和 MCP 工具
@@ -84,7 +96,9 @@ export async function getProviderTools() { // 导出提供给代理使用的工�
 }
 
 export async function getTool(name: string) { // 根据工具名称获取工具定义
-  const localTool = localToolRegistry.toolsMap.get(name);
+  const localTool =
+    localToolRegistry.toolsMap.get(name) ??
+    internalToolRegistry.toolsMap.get(name);
 
   if (localTool) {
     return localTool;
@@ -92,32 +106,4 @@ export async function getTool(name: string) { // 根据工具名称获取工具�
 
   const mcpTools = await getMcpTools();
   return mcpTools.find((tool) => tool.name === name);
-}
-
-export async function executeTool( // 执行工具函数，根据工具名称和参数调用对应的工具执行函数，并返回执行结果
-  name: string,
-  args: ToolArgs
-): Promise<ToolExecutionResult> {
-  const tool = await getTool(name);
-
-  if (!tool) {
-    return {
-      ok: false,
-      error: `Unknown tool: ${name}`,
-    };
-  }
-
-  try {
-    const result = await tool.execute(args);
-
-    return {
-      ok: true,
-      result,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : "Unknown tool error",
-    };
-  }
 }

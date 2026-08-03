@@ -1,5 +1,6 @@
 import type { ProviderMessage } from "../ai/providers/types";
 import type { StreamEvent } from "../../types/chat";
+import type { AuthContext } from "../auth/tenant-resolution";
 
 export type AgentRole =
   | "planner"
@@ -66,8 +67,10 @@ export type AgentObservation = {
 };
 
 export type MultiAgentState = {
+  auth: AuthContext | null;
   runId: string | null;
   activeStepId: string | null;
+  tenantId: string | null;
   sessionId: string | null;
   messages: ProviderMessage[];
   events: StreamEvent[];

@@ -134,10 +134,18 @@ planner
 
 ## Tool System
 
-工具体系统一经过 Tool Registry，Runtime 只关心：
+工具执行统一经过授权 Gateway，Runtime 只调用：
 
 ```ts
-executeTool(name, args)
+authorizeAndExecuteTool({
+  auth,
+  sessionId,
+  runId,
+  stepId,
+  toolCallId,
+  toolName,
+  args,
+})
 ```
 
 对应目录：
@@ -215,6 +223,8 @@ Tools：
 
 - [src/lib/tools/types.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/tools/types.ts)
 - [src/lib/tools/policy.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/tools/policy.ts)
+- [src/lib/tools/authorization/policy.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/tools/authorization/policy.ts)
+- [src/lib/mcp/tool-security.ts](/Users/sweet_77/Developer/AI_demo_test/fullstack-langgraph-agent/src/lib/mcp/tool-security.ts)
 
 权限类型：
 
@@ -232,8 +242,10 @@ Tools：
 默认策略：
 
 - 读文件 / 读网页 / 查 GitHub：`safe`
-- 写文件 / 创建 issue / 浏览器 click/type/submit：`confirm_required`
-- 删除文件 / 敏感浏览器动作：`dangerous`
+- 写文件 / Git branch、commit / 运行项目检查 / 普通浏览器交互：`confirm_required`
+- 删除文件 / Git push / 创建 Issue、PR / 敏感浏览器动作：`dangerous`，要求 `admin` 或更高角色
+- 高风险域名根据实际 URL 升级，登录、支付、凭据、2FA、生产环境等参数按内容升级
+- 未知工具、缺少风险或权限元数据、敏感文件、私网 URL、跨租户参数默认拒绝
 
 ### Filesystem Sandboxing
 
@@ -409,6 +421,8 @@ prisma/
 
 ```bash
 DATABASE_URL=file:/绝对路径到/prisma/dev.db
+BETTER_AUTH_SECRET=使用 openssl rand -base64 32 生成
+BETTER_AUTH_URL=http://localhost:3000
 DEEPSEEK_API_KEY=...
 OPENAI_API_KEY=...
 GEMINI_API_KEY=...
@@ -458,6 +472,18 @@ pnpm db:generate
 ```bash
 pnpm db:migrate
 ```
+
+创建或重置首个管理员账号和默认租户：
+
+```bash
+AUTH_BOOTSTRAP_EMAIL=admin@example.com \
+AUTH_BOOTSTRAP_NAME=Administrator \
+AUTH_BOOTSTRAP_PASSWORD='至少 12 位的临时密码' \
+pnpm auth:bootstrap
+```
+
+该命令会使用 Better Auth 的密码哈希实现创建凭据，把账号加入默认租户并设为
+`owner`。重复执行会更新密码并撤销该账号已有的登录 Session。
 
 启动开发环境：
 

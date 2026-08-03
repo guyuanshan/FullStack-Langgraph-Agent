@@ -1,68 +1,21 @@
-import { prisma } from "../db/client";
+import type { AuthContext } from "../auth/tenant-resolution";
+import {
+  getRunTrace as getTenantRunTrace,
+  listSessionRuns as listTenantSessionRuns,
+} from "../db/tenant-access";
 
-export async function listSessionRuns(sessionId: string) {
-  return prisma.agentRun.findMany({
-    where: {
-      sessionId,
-    },
-    orderBy: {
-      startedAt: "desc",
-    },
-    take: 20,
-    select: {
-      id: true,
-      runtimeType: true,
-      trigger: true,
-      status: true,
-      completionReason: true,
-      latestUserTask: true,
-      startedAt: true,
-      finishedAt: true,
-      latencyMs: true,
-      _count: {
-        select: {
-          steps: true,
-          modelCalls: true,
-          toolCalls: true,
-          interrupts: true,
-          errorLogs: true,
-        },
-      },
-    },
-  });
+/**
+ * @deprecated Prefer importing from `../db/tenant-access` directly.
+ * Bare-ID overloads are removed; all reads require AuthContext.
+ */
+export async function listSessionRuns(auth: AuthContext, sessionId: string) {
+  return listTenantSessionRuns(auth, sessionId);
 }
 
-export async function getRunTrace(runId: string) {
-  return prisma.agentRun.findUnique({
-    where: {
-      id: runId,
-    },
-    include: {
-      steps: {
-        orderBy: {
-          startedAt: "asc",
-        },
-      },
-      modelCalls: {
-        orderBy: {
-          createdAt: "asc",
-        },
-      },
-      toolCalls: {
-        orderBy: {
-          createdAt: "asc",
-        },
-      },
-      interrupts: {
-        orderBy: {
-          createdAt: "asc",
-        },
-      },
-      errorLogs: {
-        orderBy: {
-          createdAt: "asc",
-        },
-      },
-    },
-  });
+/**
+ * @deprecated Prefer importing from `../db/tenant-access` directly.
+ * Bare-ID overloads are removed; all reads require AuthContext.
+ */
+export async function getRunTrace(auth: AuthContext, runId: string) {
+  return getTenantRunTrace(auth, runId);
 }

@@ -1,4 +1,5 @@
 import { prisma } from "../db/client";
+import { resolveWriteTenantId } from "../db/tenant";
 import { RECENT_MESSAGE_WINDOW, SUMMARY_MESSAGE_PREFIX } from "./constants";
 import { summarizeToolResult } from "../tools/summary";
 
@@ -75,14 +76,54 @@ function compactMessageForContext(message: SessionMessage) {
   };
 }
 
-export async function ensureSession(sessionId: string) {
-  return prisma.session.upsert({
+export async function ensureSession(
+  sessionId: string,
+  options?: {
+    tenantId?: string;
+    userId?: string | null;
+  }
+) {
+  const existing = await prisma.session.findUnique({
     where: {
       id: sessionId,
     },
-    update: {},
-    create: {
+    select: {
+      id: true,
+      tenantId: true,
+      userId: true,
+    },
+  });
+
+  if (existing) {
+    if (options?.tenantId && existing.tenantId !== options.tenantId) {
+      throw new Error(
+        `Session ${sessionId} belongs to tenant ${existing.tenantId}, not ${options.tenantId}.`
+      );
+    }
+
+    if (options?.userId && !existing.userId) {
+      return prisma.session.update({
+        where: {
+          id: sessionId,
+        },
+        data: {
+          userId: options.userId,
+        },
+      });
+    }
+
+    return existing;
+  }
+
+  if (!options?.tenantId) {
+    throw new Error("tenantId is required to create a session");
+  }
+
+  return prisma.session.create({
+    data: {
       id: sessionId,
+      tenantId: options.tenantId,
+      userId: options.userId ?? null,
     },
   });
 }
@@ -90,14 +131,20 @@ export async function ensureSession(sessionId: string) {
 export async function getSessionMessages(
   sessionId: string,
   options?: {
+    tenantId: string;
     includeSummary?: boolean;
     recentLimit?: number;
   }
 ) {
+  if (!options?.tenantId) {
+    throw new Error("tenantId is required to read session messages");
+  }
+
   const recentLimit = options?.recentLimit ?? DEFAULT_RECENT_MESSAGE_LIMIT;
-  const session = await prisma.session.findUnique({
+  const session = await prisma.session.findFirst({
     where: {
       id: sessionId,
+      tenantId: options.tenantId,
     },
     select: {
       summary: true,
@@ -105,6 +152,7 @@ export async function getSessionMessages(
   });
   const rows = await prisma.message.findMany({
     where: {
+      tenantId: options.tenantId,
       sessionId,
       ...(recentLimit > 0
         ? {
@@ -136,9 +184,13 @@ export async function getSessionMessages(
   return messages;
 }
 
-export async function getFullSessionMessages(sessionId: string) {
+export async function getFullSessionMessages(
+  sessionId: string,
+  options: { tenantId: string }
+) {
   const rows = await prisma.message.findMany({
     where: {
+      tenantId: options.tenantId,
       sessionId,
     },
     orderBy: {
@@ -151,12 +203,17 @@ export async function getFullSessionMessages(sessionId: string) {
 
 export async function setSessionMessages(
   sessionId: string,
-  messages: SessionMessage[]
+  messages: SessionMessage[],
+  options: { tenantId: string }
 ) {
   const nextMessages = structuredClone(messages);
-  await ensureSession(sessionId);
+  const tenantId = await resolveWriteTenantId({
+    tenantId: options.tenantId,
+    sessionId,
+  });
   const existingCount = await prisma.message.count({
     where: {
+      tenantId,
       sessionId,
     },
   });
@@ -167,6 +224,7 @@ export async function setSessionMessages(
   if (messagesToAppend.length > 0) {
     await prisma.message.createMany({
       data: messagesToAppend.map((message, index) => ({
+        tenantId,
         sessionId,
         orderIndex: existingCount + index,
         role: normalizeMessageRole(message),
@@ -179,9 +237,10 @@ export async function setSessionMessages(
 
   const nextCount = existingCount + messagesToAppend.length;
 
-  await prisma.session.update({
+  await prisma.session.updateMany({
     where: {
       id: sessionId,
+      tenantId,
     },
     data: {
       messageCount: nextCount,
@@ -192,35 +251,11 @@ export async function setSessionMessages(
 
 export async function cloneSessionMessages(
   sessionId: string,
-  options?: {
+  options: {
+    tenantId: string;
     includeSummary?: boolean;
     recentLimit?: number;
   }
 ) {
   return structuredClone(await getSessionMessages(sessionId, options));
-}
-
-export async function listSessions() {
-  return prisma.session.findMany({
-    orderBy: {
-      updatedAt: "desc",
-    },
-    select: {
-      id: true,
-      title: true,
-      summary: true,
-      messageCount: true,
-      lastMessageAt: true,
-      updatedAt: true,
-      createdAt: true,
-    },
-  });
-}
-
-export async function deleteSession(sessionId: string) {
-  await prisma.session.delete({
-    where: {
-      id: sessionId,
-    },
-  });
 }

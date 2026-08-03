@@ -1,5 +1,6 @@
 import type { ProviderMessage, ProviderToolCall } from "../ai/providers/types";
 import type { StreamEvent } from "../../types/chat";
+import type { AuthContext } from "../auth/tenant-resolution";
 
 export const DEFAULT_MAX_STEPS = 5;
 
@@ -10,8 +11,10 @@ export type AgentExecutableNode = Exclude<AgentNodeName, "done">;
 export type AgentCompletionReason = "completed" | "max_steps" | "error" | null;
 
 export type AgentState = { // 代理状态类型定义
+  auth: AuthContext | null;
   runId: string | null;
   activeStepId: string | null;
+  tenantId: string | null; // 租户 ID，由 AuthContext 注入，禁止从裸 sessionId 反查
   sessionId: string | null; // 当前会话 ID，用于为工具注入会话级上下文
   messages: ProviderMessage[]; // 代理对话消息列表
   step: number; // 当前步骤数
@@ -30,11 +33,15 @@ export function createAgentState( // 创建初始代理状态
   messages: ProviderMessage[],
   maxSteps = DEFAULT_MAX_STEPS,
   sessionId: string | null = null,
-  runId: string | null = null
+  runId: string | null = null,
+  tenantId: string | null = null,
+  auth: AuthContext | null = null
 ): AgentState {
   return {
+    auth,
     runId,
     activeStepId: null,
+    tenantId,
     sessionId,
     messages,
     step: 0,

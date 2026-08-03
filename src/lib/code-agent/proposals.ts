@@ -1,8 +1,15 @@
-import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { appendToolAuditLog } from "../audit/log";
+import {
+  ErrorCodes,
+  getFileSandboxErrorCode,
+  readText,
+  validateWorkspacePath,
+  writeText,
+} from "../file-sandbox";
 import { createUnifiedDiff } from "./diff";
-import { validateWorkspacePath, WORKSPACE_ROOT } from "./workspace";
+import { getDefaultSandboxContext, WORKSPACE_ROOT } from "./workspace";
 import {
   addProjectMemoryNote,
   getProjectId,
@@ -25,6 +32,8 @@ type StoredPatchProposalFile = {
 
 export type StoredPatchProposal = {
   id: string;
+  tenantId: string;
+  userId: string | null;
   sessionId: string | null;
   title: string;
   summary: string;
@@ -54,6 +63,8 @@ function getPatchBackupDir(proposalId: string) {
 }
 
 export async function createPatchProposal(options: {
+  tenantId: string;
+  userId?: string | null;
   sessionId: string | null;
   title: string;
   summary?: string;
@@ -73,20 +84,28 @@ export async function createPatchProposal(options: {
         throw new Error("Patch proposal files must include path and content");
       }
 
-      const validated = validateWorkspacePath(file.path);
+      const writeContext = getDefaultSandboxContext("write");
+      const validated = validateWorkspacePath(writeContext, file.path, {
+        allowRoot: false,
+        access: "write",
+      });
+      const readContext = getDefaultSandboxContext("read");
       let originalContent = "";
       let isNewFile = false;
 
       try {
-        originalContent = await readFile(validated.absolutePath, "utf8");
+        const existing = await readText(readContext, file.path);
+        originalContent = existing.content;
       } catch (error) {
-        const candidate = error as NodeJS.ErrnoException;
-
-        if (candidate.code !== "ENOENT") {
-          throw error;
+        if (getFileSandboxErrorCode(error) === ErrorCodes.NOT_FOUND) {
+          isNewFile = true;
+        } else {
+          const candidate = error as NodeJS.ErrnoException;
+          if (candidate.code !== "ENOENT") {
+            throw error;
+          }
+          isNewFile = true;
         }
-
-        isNewFile = true;
       }
 
       const diff = await createUnifiedDiff(
@@ -110,8 +129,14 @@ export async function createPatchProposal(options: {
     })
   );
 
+  if (!options.tenantId.trim()) {
+    throw new Error("tenantId is required to create a patch proposal");
+  }
+
   const proposal: StoredPatchProposal = {
     id: createProposalId(),
+    tenantId: options.tenantId,
+    userId: options.userId ?? null,
     sessionId: options.sessionId,
     title: options.title.trim(),
     summary: options.summary?.trim() || "",
@@ -124,6 +149,8 @@ export async function createPatchProposal(options: {
 
   await appendToolAuditLog({
     timestamp: proposal.createdAt,
+    tenantId: proposal.tenantId,
+    sessionId: proposal.sessionId ?? undefined,
     toolName: "code_propose_patch",
     source: "local",
     riskLevel: "safe",
@@ -157,11 +184,38 @@ export function getPatchProposal(proposalId: string) {
   return patchProposalStore.get(proposalId) ?? null;
 }
 
-export async function applyPatchProposal(options: {
+export function getTenantPatchProposal(options: {
   proposalId: string;
-  files?: PatchProposalActionFile[];
+  tenantId: string;
 }) {
   const proposal = getPatchProposal(options.proposalId);
+
+  if (!proposal || proposal.tenantId !== options.tenantId) {
+    return null;
+  }
+
+  return proposal;
+}
+
+/** Test-only helper for in-memory proposal isolation checks. */
+export function __setPatchProposalForTests(proposal: StoredPatchProposal) {
+  patchProposalStore.set(proposal.id, proposal);
+}
+
+/** Test-only helper to clear the in-memory proposal store. */
+export function __clearPatchProposalsForTests() {
+  patchProposalStore.clear();
+}
+
+export async function applyPatchProposal(options: {
+  proposalId: string;
+  tenantId: string;
+  files?: PatchProposalActionFile[];
+}) {
+  const proposal = getTenantPatchProposal({
+    proposalId: options.proposalId,
+    tenantId: options.tenantId,
+  });
 
   if (!proposal) {
     throw new Error(`Unknown patch proposal: ${options.proposalId}`);
@@ -179,19 +233,20 @@ export async function applyPatchProposal(options: {
 
   const writtenFiles = [];
 
+  const writeContext = getDefaultSandboxContext("write");
+
   for (const file of proposal.files) {
     const nextContent = fileEdits.get(file.path) ?? file.proposedContent;
-    const validated = validateWorkspacePath(file.path);
     const backupPath = path.join(backupDir, file.path);
 
     await mkdir(path.dirname(backupPath), { recursive: true });
-    await mkdir(path.dirname(validated.absolutePath), { recursive: true });
 
     if (!file.isNewFile) {
-      await copyFile(validated.absolutePath, backupPath);
+      const current = await readText(getDefaultSandboxContext("read"), file.path);
+      await writeFile(backupPath, current.content, "utf8");
     }
 
-    await writeFile(validated.absolutePath, nextContent, "utf8");
+    const written = await writeText(writeContext, file.path, nextContent);
 
     file.proposedContent = nextContent;
     file.diff = await createUnifiedDiff(file.path, file.originalContent, nextContent);
@@ -199,7 +254,7 @@ export async function applyPatchProposal(options: {
     writtenFiles.push({
       path: file.path,
       backupPath: file.isNewFile ? null : backupPath,
-      bytes: Buffer.byteLength(nextContent, "utf8"),
+      bytes: written.bytes,
       isNewFile: file.isNewFile,
     });
   }
@@ -208,6 +263,8 @@ export async function applyPatchProposal(options: {
 
   await appendToolAuditLog({
     timestamp: new Date().toISOString(),
+    tenantId: proposal.tenantId,
+    sessionId: proposal.sessionId ?? undefined,
     toolName: "code_apply_patch",
     source: "local",
     riskLevel: "confirm_required",
@@ -227,10 +284,14 @@ export async function applyPatchProposal(options: {
   const appliedPaths = writtenFiles.map((file) => file.path);
   await refreshProjectMemory({
     paths: appliedPaths,
+    tenantId: proposal.tenantId,
+    sessionId: proposal.sessionId,
     embeddingProvider: "local",
   });
   await addProjectMemoryNote({
     projectId: getProjectId(),
+    tenantId: proposal.tenantId,
+    sessionId: proposal.sessionId,
     type:
       /bug|fix|修复/i.test(`${proposal.title} ${proposal.summary}`)
         ? "bug_fix"
@@ -265,9 +326,13 @@ export async function applyPatchProposal(options: {
 
 export async function rejectPatchProposal(options: {
   proposalId: string;
+  tenantId: string;
   reason?: string;
 }) {
-  const proposal = getPatchProposal(options.proposalId);
+  const proposal = getTenantPatchProposal({
+    proposalId: options.proposalId,
+    tenantId: options.tenantId,
+  });
 
   if (!proposal) {
     throw new Error(`Unknown patch proposal: ${options.proposalId}`);
@@ -277,6 +342,8 @@ export async function rejectPatchProposal(options: {
 
   await appendToolAuditLog({
     timestamp: new Date().toISOString(),
+    tenantId: proposal.tenantId,
+    sessionId: proposal.sessionId ?? undefined,
     toolName: "code_apply_patch",
     source: "local",
     riskLevel: "confirm_required",

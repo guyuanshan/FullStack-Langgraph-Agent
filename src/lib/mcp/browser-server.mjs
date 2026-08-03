@@ -240,6 +240,20 @@ async function ensureCurrentPage(inputSessionId) {
   return sessionState;
 }
 
+async function assertExpectedPageUrl(sessionState, inputUrl) {
+  const expectedUrl = await assertSafeUrl(inputUrl);
+  const currentUrl = await assertSafeUrl(sessionState.page.url());
+
+  expectedUrl.hash = "";
+  currentUrl.hash = "";
+
+  if (expectedUrl.toString() !== currentUrl.toString()) {
+    throw new Error(
+      `Browser page changed before action. Expected ${expectedUrl.toString()}, current ${currentUrl.toString()}`
+    );
+  }
+}
+
 async function readLocatorText(page, selector, maxChars) {
   const text = selector
     ? await page.locator(selector).innerText()
@@ -466,12 +480,17 @@ server.registerTool(
       destructiveHint: true,
     },
     inputSchema: {
+      url: z
+        .string()
+        .url()
+        .describe("Exact current page URL from the latest browser result"),
       selector: z.string().describe("CSS selector to click"),
       ...browserSessionSchema,
     },
   },
-  async ({ selector, browserSessionId }) => {
+  async ({ url, selector, browserSessionId }) => {
     const sessionState = await ensureCurrentPage(browserSessionId);
+    await assertExpectedPageUrl(sessionState, url);
     await sessionState.page.locator(selector).click({ timeout: timeoutMs });
     await sessionState.page
       .waitForLoadState("domcontentloaded", { timeout: timeoutMs })
@@ -495,6 +514,10 @@ server.registerTool(
       destructiveHint: true,
     },
     inputSchema: {
+      url: z
+        .string()
+        .url()
+        .describe("Exact current page URL from the latest browser result"),
       selector: z.string().describe("CSS selector to target"),
       text: z.string().describe("Text to type"),
       clearFirst: z
@@ -504,8 +527,9 @@ server.registerTool(
       ...browserSessionSchema,
     },
   },
-  async ({ selector, text, clearFirst = true, browserSessionId }) => {
+  async ({ url, selector, text, clearFirst = true, browserSessionId }) => {
     const sessionState = await ensureCurrentPage(browserSessionId);
+    await assertExpectedPageUrl(sessionState, url);
     const locator = sessionState.page.locator(selector);
     await locator.click({ timeout: timeoutMs });
 
@@ -533,14 +557,19 @@ server.registerTool(
       destructiveHint: true,
     },
     inputSchema: {
+      url: z
+        .string()
+        .url()
+        .describe("Exact current page URL from the latest browser result"),
       selector: z
         .string()
         .describe("CSS selector for a form or submit control"),
       ...browserSessionSchema,
     },
   },
-  async ({ selector, browserSessionId }) => {
+  async ({ url, selector, browserSessionId }) => {
     const sessionState = await ensureCurrentPage(browserSessionId);
+    await assertExpectedPageUrl(sessionState, url);
     const locator = sessionState.page.locator(selector);
     const elementTag = await locator.evaluate((element) => element.tagName);
 

@@ -1,5 +1,5 @@
-import { readFile } from "node:fs/promises";
-import { validateWorkspacePath } from "./workspace";
+import { getDefaultSandboxContext } from "./workspace";
+import { readText } from "../file-sandbox";
 
 const DEFAULT_MAX_CHARS_PER_FILE = 4000;
 
@@ -35,21 +35,22 @@ export async function readProjectFiles(options: {
     throw new Error("At least one path is required");
   }
 
+  const context = getDefaultSandboxContext("read");
+
   const files = await Promise.all(
     options.paths.map(async (filePath) => {
       if (typeof filePath !== "string") {
         throw new Error("File paths must be strings");
       }
 
-      const validated = validateWorkspacePath(filePath);
-      const original = await readFile(validated.absolutePath, "utf8");
-      const compact = compactContent(original, maxCharsPerFile);
+      const result = await readText(context, filePath);
+      const compact = compactContent(result.content, maxCharsPerFile);
 
       return {
-        path: validated.relativePath,
+        path: result.path,
         content: compact.content,
         truncated: compact.truncated,
-        originalLength: original.length,
+        originalLength: result.content.length,
       };
     })
   );

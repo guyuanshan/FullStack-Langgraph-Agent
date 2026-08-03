@@ -1,15 +1,21 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
 import type { ChatMessage, StreamEvent } from "../../types/chat";
+import { AccountMenu } from "../auth/AccountMenu";
 import { Message } from "../chat/Message";
 import { MessageInput } from "../chat/MessageInput";
 import { TracePanel } from "./TracePanel";
 
-const CHAT_SESSION_STORAGE_KEY = "fullstack-langgraph-agent:session-id";
+const CHAT_SESSION_STORAGE_KEY_PREFIX =
+    "fullstack-langgraph-agent:session-id";
 const USE_LANGGRAPH = true;
 const USE_MULTI_AGENT = true;
+
+function chatSessionStorageKey(tenantId: string) {
+    return `${CHAT_SESSION_STORAGE_KEY_PREFIX}:${tenantId}`;
+}
 
 type ApiMessage = {
     role: "user" | "assistant";
@@ -71,32 +77,20 @@ function parseStreamEvents(buffer: string) {
     return { events, rest };
 }
 
-function toApiMessages(messages: ChatMessage[]) {
-    return messages
-        .filter(
-            (message) =>
-                (message.role === "user" || message.role === "assistant") &&
-                message.content.trim() !== ""
-        )
-        .map((message) => ({
-            role: message.role,
-            content: message.content,
-        }));
-}
-
 function createSessionId() {
     return crypto.randomUUID();
 }
 
-function getOrCreateSessionId() {
+function getOrCreateSessionId(tenantId: string) {
     if (typeof window === "undefined") {
         return null;
     }
 
+    const storageKey = chatSessionStorageKey(tenantId);
     const storedSessionId =
-        window.localStorage.getItem(CHAT_SESSION_STORAGE_KEY) ?? createSessionId();
+        window.localStorage.getItem(storageKey) ?? createSessionId();
 
-    window.localStorage.setItem(CHAT_SESSION_STORAGE_KEY, storedSessionId);
+    window.localStorage.setItem(storageKey, storedSessionId);
 
     return storedSessionId;
 }
@@ -105,12 +99,17 @@ function toChatMessages(messages: ApiMessage[]) {
     return messages.map((message) => createMessage(message.role, message.content));
 }
 
+function canStartRuns(role: string) {
+    return role === "owner" || role === "admin" || role === "member";
+}
+
 async function streamResponse(
+    url: string,
     body: Record<string, unknown>,
     assistantMessageId: string,
     applyEvent: (event: StreamEvent, assistantMessageId: string) => void
 ) {
-    const response = await fetch("/api/chat", {
+    const response = await fetch(url, {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
@@ -160,15 +159,26 @@ async function streamResponse(
     }
 }
 
+type ChatWindowProps = {
+    account: {
+        email: string;
+        tenantId: string;
+        tenantName: string;
+        role: string;
+    };
+};
+
 // 聊天窗口组件，展示消息列表并包含消息输入框
-export function ChatWindow() {
+export function ChatWindow({ account }: ChatWindowProps) {
     // 聊天消息的状态，初始时包含一条助手消息
     const [messages, setMessages] = useState<ChatMessage[]>([
         createMessage("assistant", "你好，我是你的 AI Agent 助手。"),
     ]);
     // 加载状态，防止重复发送消息
     const [isLoading, setIsLoading] = useState(false);
-    const [sessionId, setSessionId] = useState<string | null>(() => getOrCreateSessionId());
+    const [sessionId, setSessionId] = useState<string | null>(() =>
+        getOrCreateSessionId(account.tenantId)
+    );
     const [sessions, setSessions] = useState<SessionListItem[]>([]);
     const [currentRunId, setCurrentRunId] = useState<string | null>(null);
     const [currentRunStatus, setCurrentRunStatus] = useState<
@@ -185,12 +195,30 @@ export function ChatWindow() {
         () => sessionId !== null
     );
 
+    const activeTenantIdRef = useRef(account.tenantId);
+
+    useEffect(() => {
+        if (activeTenantIdRef.current === account.tenantId) {
+            return;
+        }
+
+        activeTenantIdRef.current = account.tenantId;
+        const nextSessionId = getOrCreateSessionId(account.tenantId);
+        setSessionId(nextSessionId);
+        setMessages([createMessage("assistant", "你好，我是你的 AI Agent 助手。")]);
+        setIsSessionLoading(nextSessionId !== null);
+        setCurrentRunId(null);
+        setCurrentRunStatus(null);
+        setCurrentAgent(null);
+        setSessions([]);
+    }, [account.tenantId]);
+
     useEffect(() => {
         let isCancelled = false;
 
         async function loadSessions() {
             try {
-                const response = await fetch("/api/chat?includeSessions=true");
+                const response = await fetch("/api/sessions");
 
                 if (!response.ok) {
                     throw new Error(`Failed to load sessions ${response.status}`);
@@ -224,7 +252,7 @@ export function ChatWindow() {
         async function loadSession() {
             try {
                 const response = await fetch(
-                    `/api/chat?sessionId=${encodeURIComponent(currentSessionId)}&useLangGraph=${String(USE_LANGGRAPH)}`
+                    `/api/sessions/${encodeURIComponent(currentSessionId)}/messages?useLangGraph=${String(USE_LANGGRAPH)}`
                 );
 
                 if (!response.ok) {
@@ -380,6 +408,7 @@ export function ChatWindow() {
                             createdAt: Date.now(),
                             toolName: event.toolName,
                             toolCallId: event.toolCallId,
+                            approvalId: event.approvalId,
                             toolStatus: "confirm_required",
                             toolArgs: event.args,
                             confirmMessage: event.message,
@@ -397,6 +426,7 @@ export function ChatWindow() {
                     index === existingIndex
                         ? {
                             ...message,
+                            approvalId: event.approvalId,
                             toolStatus: "confirm_required",
                             toolArgs: event.args,
                             confirmMessage: event.message,
@@ -531,6 +561,7 @@ export function ChatWindow() {
     // 处理发送消息的函数，负责与后端 API 交互并更新消息列表
     async function handleSendMessage(content: string) {
         if (isLoading || isSessionLoading || !sessionId) return;
+        if (!canStartRuns(account.role)) return;
         // 创建一个新的用户消息对象，并添加到消息列表中
         const userMessage = createMessage("user", content);
         // 创建一个新的助手消息对象，初始内容为空，后续会通过 SSE 更新内容
@@ -539,27 +570,25 @@ export function ChatWindow() {
         setMessages((prev) => [...prev, userMessage, assistantMessage]);
         setIsLoading(true);
 
-        const nextMessages = [
-            ...toApiMessages(messages),
-            {
-                role: "user",
-                content: content,
-            },
-        ];
-
         try {
             await streamResponse(
+                `/api/sessions/${encodeURIComponent(sessionId)}/runs`,
                 {
-                    sessionId,
+                    kind: "start",
                     useLangGraph: USE_LANGGRAPH,
                     useMultiAgent: USE_MULTI_AGENT,
-                    messages: nextMessages,
+                    messages: [
+                        {
+                            role: "user",
+                            content,
+                        },
+                    ],
                 },
                 assistantMessage.id,
                 (event, nextAssistantMessageId) =>
                     applyStreamEvent(event, nextAssistantMessageId, setMessages)
             );
-            const sessionsResponse = await fetch("/api/chat?includeSessions=true");
+            const sessionsResponse = await fetch("/api/sessions");
             if (sessionsResponse.ok) {
                 const data = (await sessionsResponse.json()) as SessionListResponse;
                 setSessions(data.sessions);
@@ -584,7 +613,10 @@ export function ChatWindow() {
 
     function handleCreateSession() {
         const nextSessionId = createSessionId();
-        window.localStorage.setItem(CHAT_SESSION_STORAGE_KEY, nextSessionId);
+        window.localStorage.setItem(
+            chatSessionStorageKey(account.tenantId),
+            nextSessionId
+        );
         setSessionId(nextSessionId);
         setMessages([createMessage("assistant", "你好，我是你的 AI Agent 助手。")]);
         setIsSessionLoading(false);
@@ -594,7 +626,10 @@ export function ChatWindow() {
     }
 
     function handleSwitchSession(nextSessionId: string) {
-        window.localStorage.setItem(CHAT_SESSION_STORAGE_KEY, nextSessionId);
+        window.localStorage.setItem(
+            chatSessionStorageKey(account.tenantId),
+            nextSessionId
+        );
         setSessionId(nextSessionId);
         setIsSessionLoading(true);
         setCurrentRunId(null);
@@ -607,15 +642,8 @@ export function ChatWindow() {
             return;
         }
 
-        await fetch("/api/chat", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-                sessionId: targetSessionId,
-                deleteSession: true,
-            }),
+        await fetch(`/api/sessions/${encodeURIComponent(targetSessionId)}`, {
+            method: "DELETE",
         });
 
         const remainingSessions = sessions.filter(
@@ -662,14 +690,16 @@ export function ChatWindow() {
         setIsLoading(true);
 
         try {
+            const approvalId = message.approvalId;
+
+            if (!approvalId) {
+                throw new Error("Missing server approvalId for confirmation.");
+            }
+
             await streamResponse(
+                `/api/tool-approvals/${encodeURIComponent(approvalId)}/decision`,
                 {
-                    sessionId,
-                    useLangGraph: USE_LANGGRAPH,
-                    useMultiAgent: USE_MULTI_AGENT,
-                    confirmation: {
-                        decision,
-                    },
+                    decision,
                 },
                 assistantMessageId,
                 (event, nextAssistantMessageId) =>
@@ -727,22 +757,19 @@ export function ChatWindow() {
         );
 
         try {
-            const response = await fetch("/api/chat", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                    sessionId,
-                    useLangGraph: USE_LANGGRAPH,
-                    useMultiAgent: USE_MULTI_AGENT,
-                    patchAction: {
-                        action,
-                        proposalId,
-                        files,
+            const response = await fetch(
+                `/api/patch-proposals/${encodeURIComponent(proposalId)}/decision`,
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
                     },
-                }),
-            });
+                    body: JSON.stringify({
+                        action,
+                        files,
+                    }),
+                }
+            );
 
             const data = (await response.json()) as PatchActionResponse;
 
@@ -842,13 +869,20 @@ export function ChatWindow() {
                 <header className="border-b px-4 py-3">
                     <div className="flex items-center justify-between gap-3">
                         <h1 className="text-lg font-semibold">Fullstack LangGraph Agent</h1>
-                        <button
-                            type="button"
-                            onClick={handleCreateSession}
-                            className="rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-700 md:hidden"
-                        >
-                            新建会话
-                        </button>
+                        <div className="flex items-center gap-2">
+                            <button
+                                type="button"
+                                onClick={handleCreateSession}
+                                className="rounded-lg border border-slate-300 px-3 py-2 text-xs text-slate-700 md:hidden"
+                            >
+                                新建会话
+                            </button>
+                            <AccountMenu
+                                email={account.email}
+                                tenantName={account.tenantName}
+                                role={account.role}
+                            />
+                        </div>
                     </div>
                 </header>
 
@@ -873,7 +907,13 @@ export function ChatWindow() {
                     ))}
                 </section>
 
-                <MessageInput onSendMessage={handleSendMessage} />
+                {canStartRuns(account.role) ? (
+                    <MessageInput onSendMessage={handleSendMessage} />
+                ) : (
+                    <div className="border-t px-4 py-3 text-sm text-slate-500">
+                        当前角色为 viewer，只能查看会话，不能发起 Agent Run。
+                    </div>
+                )}
             </div>
 
             <TracePanel
